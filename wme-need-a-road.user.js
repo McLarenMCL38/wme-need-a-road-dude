@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WME Need a Road, Dude! (GPS Trace vs Road Checker)
+// @name         WME Need a Road, Dude!
 // @namespace    https://github.com/Waze
-// @version      1.3.0
-// @description  Scans WME at Zoom 18+ for GPS traces with no drivable road segment underneath. Automatically enables ROADS and GPS layers, reads vector & raster GPS traces, loads editor Editable/Managed Areas, crawls at Zoom 18+ with Pause/Stop/Resume controls, provides semi-automated road drawing, and generates Zoom 18 permalinks.
+// @version      1.4.0
+// @description  Spots unmapped roads in Waze Map Editor (WME) at Zoom 18+, compiles a persistent work queue across sessions, scans 4 km² and 20 km² or Editable Areas, draws clean minimal-node roads, and exports Zoom 18 permalinks.
 // @author       McLaren with assistive AI
 // @match        https://*.waze.com/*editor*
 // @match        https://www.waze.com/editor*
@@ -15,12 +15,41 @@
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=waze.com
 // ==/UserScript==
 
+/* ============================================================================
+   🎉 UPDATE NOTES — v1.4.0 ("The 'Stop Touching My List & Sober Up the Road' Update")
+   ============================================================================
+   🧠 Amnesia Cured (Persistent Queue):
+      - Previously, clicking "Go" or "Draw" made the rest of your scanned list
+        pull a Houdini and vanish. Fixed! Your compiled queue now stays put AND
+        saves to your browser so you can go touch grass and finish editing tomorrow.
+
+   📐 Sober Road Drawing (Minimal Nodes):
+      - GPS traces bounce around like a shopping cart with a broken wheel.
+        "Draw" now uses orthogonal regression + RDP smoothing so straight streets
+        get ZERO extra geometry nodes (just Point A to Point B), and curves only
+        keep the bends that actually matter.
+
+   🪶 Shrink Ray & Drag Handle:
+      - Tired of the panel hogging half your monitor like an uninvited passenger?
+        Grab the blue header bar to drag it anywhere! Even better: once a scan
+        wraps up, it automatically folds into a tiny "Compact Fixer Bar" so you
+        can step through stretches (◀ / ▶) with maximum map space.
+
+   🗺️ Goldilocks Scan Sizes (4 km² & 20 km²):
+      - Added "Surrounding Window (4 km²)" for a quick coffee-break sweep and
+        "Wide Surrounding Window (20 km²)" for when you're feeling ambitious,
+        plus CSV export for spreadsheet lovers.
+
+   ✂️ Title Liposuction:
+      - Trimmed the mouthful subtitle off the script name & description.
+   ============================================================================ */
+
 (function () {
     'use strict';
 
     const SCRIPT_NAME = 'Need a Road, Dude!';
     const SCRIPT_SHORT = 'NeedARoad';
-    const SCRIPT_VERSION = '1.3.0';
+    const SCRIPT_VERSION = '1.4.0';
 
     // Global reference to page window / unsafeWindow
     const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
@@ -42,17 +71,22 @@
 
     // Default Configuration & Settings State
     const settings = {
-        proximityThresholdMeters: 6,  // Max distance (meters) between GPS point and drivable segment to count as covered
-        minPointsPerStretch: 3,       // Minimum unmapped GPS points to trigger a stretch alert (filters drift)
-        clusterDistanceMeters: 60,    // Points within this distance are grouped into the same stretch
-        crawlerStepDelayMs: 1800,     // Delay per tile during crawl to allow WME to download & render Zoom 18+ GPS tiles
-        crawlerZoomLevel: 18,         // Crawler zoom level (strictly >= 18 so GPS traces load)
-        autoScanOnMove: true,         // Automatically re-scan when map stops moving at Zoom 18+
-        soundAlerts: false,           // Play a subtle chime when missing roads are found
-        highlightColor: '#ff2d55',    // Glowing color for missing road GPS points
-        highlightGlow: '#ff9500',     // Secondary halo glow
+        proximityThresholdMeters: 6,     // Max distance (meters) between GPS point and drivable segment to count as covered
+        minPointsPerStretch: 3,          // Minimum unmapped GPS points to trigger a stretch alert (filters drift)
+        clusterDistanceMeters: 60,       // Points within this distance are grouped into the same stretch
+        drawSimplifyToleranceMeters: 8,  // Straightness / RDP tolerance (meters) for minimal-node road drawing
+        crawlerStepDelayMs: 1800,        // Delay per tile during crawl to allow WME to download & render Zoom 18+ GPS tiles
+        crawlerZoomLevel: 18,            // Crawler zoom level (strictly >= 18 so GPS traces load)
+        autoScanOnMove: true,            // Automatically scan & append new stretches when map stops moving at Zoom 18+
+        autoCompactAfterScan: true,      // Shrink into compact draggable fixer bar once a scan/crawl finishes with results
+        soundAlerts: false,              // Play a subtle chime when missing roads are found
+        highlightColor: '#ff2d55',       // Glowing color for missing road GPS points
+        highlightGlow: '#ff9500',        // Secondary halo glow
         panelCollapsed: false,
-        zoomMinRequired: 18           // WME requires Zoom 18+ to load and display GPS traces
+        uiMode: 'full',                  // 'full' | 'compact'
+        panelLeft: null,                 // Persisted draggable X coordinate (px)
+        panelTop: null,                  // Persisted draggable Y coordinate (px)
+        zoomMinRequired: 18              // WME requires Zoom 18+ to load and display GPS traces
     };
 
     // Load persisted settings with strict Zoom 18+ floor migration
@@ -65,12 +99,17 @@
     } catch (e) {
         console.warn(`[${SCRIPT_SHORT}] Could not load settings:`, e);
     }
-    // Enforce Zoom 18+ minimum even if older settings were cached in localStorage
     if (!Number.isFinite(settings.zoomMinRequired) || settings.zoomMinRequired < 18) {
         settings.zoomMinRequired = 18;
     }
     if (!Number.isFinite(settings.crawlerZoomLevel) || settings.crawlerZoomLevel < 18) {
         settings.crawlerZoomLevel = 18;
+    }
+    if (!Number.isFinite(settings.drawSimplifyToleranceMeters) || settings.drawSimplifyToleranceMeters < 2) {
+        settings.drawSimplifyToleranceMeters = 8;
+    }
+    if (settings.uiMode !== 'compact' && settings.uiMode !== 'full') {
+        settings.uiMode = 'full';
     }
 
     function saveSettings() {
@@ -101,6 +140,8 @@
     let isScanning = false;
     let scanTimeout = null;
     let networkHookInstalled = false;
+    let suppressAutoScanUntil = 0;       // Prevents Go To / Draw jumps from triggering unnecessary re-scans
+    let activeStretchIndex = 0;          // Currently focused stretch in Compact Fixer & Queue list
 
     // GPS Data & Raster Tile Cache
     const capturedGpsPoints = new Map(); // key -> { lon, lat, x, y, timestamp }
@@ -108,13 +149,75 @@
     const cachedNetworkAreas = [];       // Editable / Managed area objects captured from WME responses
     let cachedResolvedAreas = [];        // Latest list used in the Area Picker dropdown
 
-    // Analysis Results
+    // Analysis Results & Persistent Compiled Queue
     let currentResults = {
         totalGpsInView: 0,
         unmappedGpsCount: 0,
         coveredGpsCount: 0,
-        stretches: [] // Array of { id, centerLat, centerLon, pointCount, points: [...], permalink, approxLengthMeters }
+        stretches: [] // Array of { id, centerLat, centerLon, pointCount, points: [...], permalink, approxLengthMeters, sourceArea }
     };
+
+    function saveCompiledQueue() {
+        try {
+            const serialized = currentResults.stretches.slice(0, 500).map((s, idx) => ({
+                id: idx + 1,
+                centerLat: Number(s.centerLat.toFixed(6)),
+                centerLon: Number(s.centerLon.toFixed(6)),
+                pointCount: s.pointCount,
+                approxLengthMeters: s.approxLengthMeters,
+                permalink: s.permalink,
+                sourceArea: s.sourceArea || '',
+                pts: (s.points || []).slice(0, 60).map(p => [Number(p.lon.toFixed(6)), Number(p.lat.toFixed(6))])
+            }));
+            localStorage.setItem('WME_NeedARoad_CompiledQueue', JSON.stringify({
+                savedAt: Date.now(),
+                activeStretchIndex,
+                stretches: serialized
+            }));
+        } catch (e) {
+            console.warn(`[${SCRIPT_SHORT}] Could not persist compiled queue:`, e);
+        }
+    }
+
+    function loadCompiledQueue() {
+        try {
+            const raw = localStorage.getItem('WME_NeedARoad_CompiledQueue');
+            if (!raw) return 0;
+            const parsed = JSON.parse(raw);
+            if (!parsed || !Array.isArray(parsed.stretches)) return 0;
+
+            const restored = [];
+            for (const item of parsed.stretches) {
+                if (!Number.isFinite(item.centerLat) || !Number.isFinite(item.centerLon)) continue;
+                if (isStretchDismissed(item.centerLat, item.centerLon)) continue;
+                const pts = Array.isArray(item.pts)
+                    ? item.pts.map(pair => ({ lon: pair[0], lat: pair[1] })).filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat))
+                    : [{ lon: item.centerLon, lat: item.centerLat }];
+                restored.push({
+                    id: restored.length + 1,
+                    centerLat: item.centerLat,
+                    centerLon: item.centerLon,
+                    pointCount: item.pointCount || pts.length,
+                    approxLengthMeters: item.approxLengthMeters || 20,
+                    points: pts,
+                    permalink: item.permalink || generatePermalink(item.centerLat, item.centerLon, 18),
+                    sourceArea: item.sourceArea || ''
+                });
+            }
+            currentResults.stretches = restored;
+            activeStretchIndex = Math.max(0, Math.min(parsed.activeStretchIndex || 0, Math.max(0, restored.length - 1)));
+            return restored.length;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function reindexStretches() {
+        currentResults.stretches.forEach((s, i) => { s.id = i + 1; });
+        if (activeStretchIndex >= currentResults.stretches.length) {
+            activeStretchIndex = Math.max(0, currentResults.stretches.length - 1);
+        }
+    }
 
     // Crawler State Machine: status in 'idle' | 'running' | 'paused' | 'stopped'
     let crawlerState = {
@@ -1619,9 +1722,39 @@
             addUniqueArea(na);
         }
 
-        // 7. Guaranteed Viewport & Neighborhood Options (placed after user's Editable Areas, or first if none loaded yet)
+        // 7. Guaranteed Window-Centered Scan Areas (Current Viewport, 4 km² Area, and 20 km² Area)
         const extent = getMapExtent();
         if (extent) {
+            const cLon = (extent.minLon + extent.maxLon) / 2;
+            const cLat = (extent.minLat + extent.maxLat) / 2;
+            const kmPerDegLat = 110.574;
+            const kmPerDegLon = Math.max(20, 111.320 * Math.cos(cLat * Math.PI / 180));
+
+            function makeCenteredSquareArea(areaSqKm, label, fixedId) {
+                const halfSideKm = Math.sqrt(areaSqKm) / 2;
+                const dLat = halfSideKm / kmPerDegLat;
+                const dLon = halfSideKm / kmPerDegLon;
+                const polys = extractPolygonsFromAnyGeometry({
+                    type: 'Polygon',
+                    coordinates: [[
+                        [cLon - dLon, cLat - dLat],
+                        [cLon + dLon, cLat - dLat],
+                        [cLon + dLon, cLat + dLat],
+                        [cLon - dLon, cLat + dLat],
+                        [cLon - dLon, cLat - dLat]
+                    ]]
+                });
+                const entry = buildAreaEntry(polys, label, fixedId);
+                if (entry) {
+                    entry.id = fixedId;
+                    entry.name = `${label} (${areaSqKm} km²)`;
+                }
+                return entry;
+            }
+
+            const area4 = makeCenteredSquareArea(4, '🗺️ Surrounding Window', 'scan_area_4km2');
+            const area20 = makeCenteredSquareArea(20, '🌐 Wide Surrounding Window', 'scan_area_20km2');
+
             const vpPolys = extractPolygonsFromAnyGeometry({
                 type: 'Polygon',
                 coordinates: [[
@@ -1635,24 +1768,9 @@
             const vpEntry = buildAreaEntry(vpPolys, '📍 Current Viewport (Screen)', 'current_viewport');
             if (vpEntry) vpEntry.id = 'current_viewport';
 
-            const cLon = (extent.minLon + extent.maxLon) / 2;
-            const cLat = (extent.minLat + extent.maxLat) / 2;
-            const span = 0.0135; // ~1.5 km radius (~3x3 km box)
-            const nbPolys = extractPolygonsFromAnyGeometry({
-                type: 'Polygon',
-                coordinates: [[
-                    [cLon - span, cLat - span],
-                    [cLon + span, cLat - span],
-                    [cLon + span, cLat + span],
-                    [cLon - span, cLat + span],
-                    [cLon - span, cLat - span]
-                ]]
-            });
-            const nbEntry = buildAreaEntry(nbPolys, '🗺️ Surrounding Region (~3x3 km)', 'current_neighborhood');
-            if (nbEntry) nbEntry.id = 'current_neighborhood';
-
+            if (area4) areas.push(area4);
+            if (area20) areas.push(area20);
             if (vpEntry) areas.push(vpEntry);
-            if (nbEntry) areas.push(nbEntry);
         }
 
         cachedResolvedAreas = areas;
@@ -1660,7 +1778,7 @@
     }
 
     /* ==========================================================================
-       6. CORE SCANNING & CROSS-CHECKING LOGIC (Zoom 18+)
+       6. CORE SCANNING & COMPILED QUEUE MERGING (Zoom 18+)
        ========================================================================== */
     async function runScanner(options = {}) {
         if (isScanning) return;
@@ -1692,9 +1810,14 @@
 
             if (gpsPoints.length === 0) {
                 if (!options.isCrawlerStep) {
-                    updateStatusText(`No GPS traces visible at Zoom ${zoom} here. (None recorded or still loading).`);
-                    clearHighlights();
-                    currentResults = { totalGpsInView: 0, unmappedGpsCount: 0, coveredGpsCount: 0, stretches: [] };
+                    const qLen = currentResults.stretches.length;
+                    if (qLen > 0) {
+                        updateStatusText(`No extra GPS traces in this view. (${qLen} stretch(es) kept in your compiled queue).`);
+                        renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+                    } else {
+                        updateStatusText(`No GPS traces visible at Zoom ${zoom} here. (None recorded or still loading).`);
+                        clearHighlights();
+                    }
                     renderAlertList();
                 }
                 return;
@@ -1746,27 +1869,29 @@
                 currentResults.totalGpsInView += gpsPoints.length;
                 currentResults.coveredGpsCount += coveredCount;
                 currentResults.unmappedGpsCount += unmappedPoints.length;
-                mergeCrawlerStretches(activeStretches);
+                mergeStretchesIntoQueue(activeStretches, crawlerState.selectedAreaName || 'Area Crawl');
             } else {
-                currentResults = {
-                    totalGpsInView: gpsPoints.length,
-                    unmappedGpsCount: unmappedPoints.length,
-                    coveredGpsCount: coveredCount,
-                    stretches: activeStretches
-                };
-            }
+                // Additive merge: NEVER erase previously compiled stretches outside the current viewport!
+                currentResults.totalGpsInView = gpsPoints.length;
+                currentResults.coveredGpsCount = coveredCount;
+                currentResults.unmappedGpsCount = unmappedPoints.length;
+                const addedCount = mergeStretchesIntoQueue(activeStretches, 'Viewport Scan');
 
-            renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
-            renderAlertList();
+                if (options.isManualScan && settings.autoCompactAfterScan && currentResults.stretches.length > 0) {
+                    setUiMode('compact');
+                }
 
-            if (!options.isCrawlerStep) {
-                if (currentResults.stretches.length > 0) {
-                    updateStatusText(`🚨 Found ${currentResults.stretches.length} stretch(es) needing a road at Zoom ${zoom}!`);
-                    if (settings.soundAlerts) playChime();
+                if (activeStretches.length > 0) {
+                    updateStatusText(`🚨 ${activeStretches.length} in view (${addedCount} new) | 📋 ${currentResults.stretches.length} total in compiled queue.`);
+                } else if (currentResults.stretches.length > 0) {
+                    updateStatusText(`✅ View clear (${gpsPoints.length} pts on road) | 📋 ${currentResults.stretches.length} stretch(es) in compiled queue.`);
                 } else {
                     updateStatusText(`✅ All ${gpsPoints.length} GPS trace samples in view have drivable roads underneath.`);
                 }
             }
+
+            renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+            renderAlertList();
         } catch (err) {
             console.error(`[${SCRIPT_SHORT}] Error during scan:`, err);
             updateStatusText(`❌ Scan error: ${err.message}`);
@@ -1776,29 +1901,37 @@
         }
     }
 
-    function mergeCrawlerStretches(newStretches) {
-        let foundNew = false;
+    function mergeStretchesIntoQueue(newStretches, sourceArea = '') {
+        let addedCount = 0;
         for (const ns of newStretches) {
-            const alreadyExists = currentResults.stretches.some(existing => {
-                const d = haversineDistanceMeters(existing.centerLat, existing.centerLon, ns.centerLat, ns.centerLon);
+            const existing = currentResults.stretches.find(ex => {
+                const d = haversineDistanceMeters(ex.centerLat, ex.centerLon, ns.centerLat, ns.centerLon);
                 return d < 75;
             });
-            if (!alreadyExists) {
+            if (!existing) {
                 ns.id = currentResults.stretches.length + 1;
+                ns.sourceArea = sourceArea;
                 currentResults.stretches.push(ns);
-                crawlerState.totalStretchesFound++;
-                foundNew = true;
+                if (crawlerState.status === 'running') crawlerState.totalStretchesFound++;
+                addedCount++;
+            } else if (ns.points && ns.points.length > (existing.points ? existing.points.length : 0)) {
+                // Enrich existing stretch if fuller GPS trace view was captured
+                existing.points = ns.points;
+                existing.pointCount = ns.pointCount;
+                existing.approxLengthMeters = Math.max(existing.approxLengthMeters || 0, ns.approxLengthMeters || 0);
             }
         }
-        if (foundNew && settings.soundAlerts) {
-            playChime();
+        if (addedCount > 0) {
+            saveCompiledQueue();
+            if (settings.soundAlerts) playChime();
         }
+        return addedCount;
     }
 
     function debounceScan(delayMs = 500) {
         if (scanTimeout) clearTimeout(scanTimeout);
         scanTimeout = setTimeout(() => {
-            if (crawlerState.status !== 'running') {
+            if (crawlerState.status !== 'running' && Date.now() >= suppressAutoScanUntil) {
                 const z = getCurrentZoom();
                 if (z >= 18) runScanner();
                 else updateZoomPill();
@@ -1902,12 +2035,13 @@
 
         select.selectedIndex = restoredIndex;
 
-        const permissionCount = areas.filter(a => a.id !== 'current_viewport' && a.id !== 'current_neighborhood').length;
+        const builtInIds = new Set(['current_viewport', 'scan_area_4km2', 'scan_area_20km2']);
+        const permissionCount = areas.filter(a => !builtInIds.has(a.id)).length;
         if (showFeedback) {
             if (permissionCount > 0) {
-                showToast(`Loaded ${permissionCount} Editable / Managed Area(s)!`, 'success');
+                showToast(`Loaded ${permissionCount} Editable / Managed Area(s) + 4 km² & 20 km² window scans!`, 'success');
             } else {
-                showToast('Editor permission polygons not yet sent by WME; Viewport & Surrounding Region ready.', 'info');
+                showToast('4 km², 20 km², and Current Viewport scan areas ready!', 'info');
             }
         }
     }
@@ -1955,22 +2089,19 @@
     }
 
     async function startGridCrawler() {
-        const areas = cachedResolvedAreas.length > 0 ? cachedResolvedAreas : getEditorPermissions();
-        if (!areas || areas.length === 0) {
+        // Always refresh window-relative areas (4 km², 20 km², Current Viewport) from the LIVE WME window!
+        const select = document.getElementById('nar-crawler-area-select');
+        const selectedId = select?.options[select.selectedIndex]?.dataset?.areaId || null;
+        const freshAreas = getEditorPermissions();
+        if (!freshAreas || freshAreas.length === 0) {
             showToast('No areas available to crawl yet.', 'warning');
             return;
         }
 
-        const select = document.getElementById('nar-crawler-area-select');
-        const areaIndex = Math.max(0, parseInt(select ? select.value : '0', 10) || 0);
-        const targetArea = areas[areaIndex] || areas[0];
-
-        // Refresh Current Viewport dynamically if chosen
-        let activeArea = targetArea;
-        if (targetArea.id === 'current_viewport') {
-            const freshAreas = getEditorPermissions();
-            const freshVp = freshAreas.find(a => a.id === 'current_viewport');
-            if (freshVp) activeArea = freshVp;
+        let activeArea = freshAreas.find(a => a.id === selectedId);
+        if (!activeArea) {
+            const areaIndex = Math.max(0, parseInt(select ? select.value : '0', 10) || 0);
+            activeArea = freshAreas[areaIndex] || freshAreas[0];
         }
 
         const crawlZoom = Math.max(18, settings.crawlerZoomLevel || 18);
@@ -1979,6 +2110,7 @@
         ensureRequiredLayers();
         const startCenterLat = (activeArea.bbox.minLat + activeArea.bbox.maxLat) / 2;
         const startCenterLon = (activeArea.bbox.minLon + activeArea.bbox.maxLon) / 2;
+        suppressAutoScanUntil = Date.now() + 3000;
         await goToLocationAndVerifyZoom(startCenterLat, startCenterLon, crawlZoom);
 
         // Compute Zoom-18+ tile step with 20% overlap so zero GPS traces are missed between tiles
@@ -2016,12 +2148,10 @@
             totalStretchesFound: 0
         };
 
-        currentResults = {
-            totalGpsInView: 0,
-            unmappedGpsCount: 0,
-            coveredGpsCount: 0,
-            stretches: []
-        };
+        // Keep existing compiled queue stretches and append newly discovered ones!
+        currentResults.totalGpsInView = 0;
+        currentResults.unmappedGpsCount = 0;
+        currentResults.coveredGpsCount = 0;
         renderAlertList();
         updateCrawlerUI();
         showToast(`🚀 Crawling at Zoom ${crawlZoom}: ${tiles.length} tile(s) in ${activeArea.name}`, 'info');
@@ -2044,9 +2174,10 @@
         const progressPct = Math.round(((idx + 1) / total) * 100);
 
         updateCrawlerProgress(`Tile ${idx + 1}/${total} (${progressPct}%)`);
-        updateStatusText(`🔍 Crawling Tile ${idx + 1}/${total} at Zoom ${crawlZoom}... (${currentResults.stretches.length} found)`);
+        updateStatusText(`🔍 Crawling Tile ${idx + 1}/${total} at Zoom ${crawlZoom}... (${currentResults.stretches.length} in queue)`);
 
         // Move to tile strictly at Zoom 18+ and verify WME zoom >= 18
+        suppressAutoScanUntil = Date.now() + settings.crawlerStepDelayMs + 1500;
         await goToLocationAndVerifyZoom(tile.lat, tile.lon, crawlZoom);
 
         if (crawlerState.status !== 'running' || runId !== crawlerState.stepRunId) return;
@@ -2084,14 +2215,15 @@
         crawlerState.isActive = true;
         crawlerState.isPaused = true;
 
+        saveCompiledQueue();
         const idx = Math.min(crawlerState.currentTileIndex + 1, crawlerState.tiles.length);
         const total = crawlerState.tiles.length;
         const pct = total > 0 ? Math.round((crawlerState.currentTileIndex / total) * 100) : 0;
 
         updateCrawlerUI();
         updateCrawlerProgress(`⏸️ Paused ${idx}/${total} (${pct}%)`);
-        updateStatusText(`⏸️ Paused at Tile ${idx}/${total}. Click '▶️ Resume' to continue.`);
-        showToast(`Crawler paused at Tile ${idx}/${total}. Click Resume when ready!`, 'info');
+        updateStatusText(`⏸️ Paused at Tile ${idx}/${total} (${currentResults.stretches.length} queued). Click '▶️ Resume' to continue.`);
+        showToast(`Crawler paused at Tile ${idx}/${total}. Queue saved!`, 'info');
     }
 
     function stopGridCrawler() {
@@ -2101,6 +2233,7 @@
             crawlerState.timeoutId = null;
         }
         crawlerState.stepRunId++;
+        saveCompiledQueue();
 
         const hasRemainingTiles = crawlerState.tiles.length > 0 && crawlerState.currentTileIndex < crawlerState.tiles.length;
         if (hasRemainingTiles) {
@@ -2114,8 +2247,11 @@
 
             updateCrawlerUI();
             updateCrawlerProgress(`⏹️ Stopped ${idx}/${total} (${pct}%)`);
-            updateStatusText(`⏹️ Stopped at Tile ${idx}/${total} (${currentResults.stretches.length} found). Click '▶️ Resume' to continue!`);
-            showToast(`Crawler stopped. Click '▶️ Resume' anytime to continue from Tile ${idx}/${total}!`, 'info');
+            updateStatusText(`⏹️ Stopped at Tile ${idx}/${total} (${currentResults.stretches.length} saved in queue). Click '▶️ Resume' anytime!`);
+            showToast(`Crawler stopped (${currentResults.stretches.length} saved in queue). Click '▶️ Resume' anytime!`, 'info');
+            if (settings.autoCompactAfterScan && currentResults.stretches.length > 0) {
+                setUiMode('compact');
+            }
         } else {
             finishGridCrawler();
         }
@@ -2156,31 +2292,44 @@
         crawlerState.isActive = false;
         crawlerState.isPaused = false;
 
+        saveCompiledQueue();
         updateCrawlerUI();
         updateCrawlerProgress(`✅ Done (${crawlerState.tiles.length}/${crawlerState.tiles.length})`);
-        showToast(`🎉 Crawler finished! Found ${currentResults.stretches.length} missing road stretch(es).`, 'success');
-        updateStatusText(`🎉 Crawl complete! Discovered ${currentResults.stretches.length} missing road stretch(es).`);
+        showToast(`🎉 Crawl complete! ${currentResults.stretches.length} stretch(es) saved in queue.`, 'success');
+        updateStatusText(`🎉 Crawl complete! ${currentResults.stretches.length} stretch(es) compiled & saved for editing.`);
+
+        if (settings.autoCompactAfterScan && currentResults.stretches.length > 0) {
+            activeStretchIndex = 0;
+            setUiMode('compact');
+            renderAlertList();
+        }
     }
 
     /* ==========================================================================
-       8. SEMI-AUTOMATED "DRAW ROAD" ACTION (Inserts Draft Street)
+       8. MINIMAL-NODE CENTERLINE SMOOTHING & "DRAW ROAD" ACTION
+          (PCA Orthogonal Regression + Cross-Track Averaging + RDP Simplification)
        ========================================================================== */
     async function drawDraftRoad(stretchId) {
-        const stretch = currentResults.stretches.find(s => s.id === stretchId);
-        if (!stretch || stretch.points.length < 2) {
+        const stretchIdx = currentResults.stretches.findIndex(s => s.id === stretchId);
+        const stretch = stretchIdx >= 0 ? currentResults.stretches[stretchIdx] : null;
+        if (!stretch || !stretch.points || stretch.points.length < 2) {
             showToast('Need at least 2 GPS points to draw a road.', 'warning');
             return;
         }
 
+        activeStretchIndex = stretchIdx;
+        suppressAutoScanUntil = Date.now() + 3000;
         await goToLocationAndVerifyZoom(stretch.centerLat, stretch.centerLon, 18);
-        const sortedPoints = sortGpsPointsAlongTrajectory(stretch.points);
+
+        const cleanRoadNodes = buildMinimalNodeRoadPoints(stretch.points, settings.drawSimplifyToleranceMeters || 8);
+        const internalNodes = Math.max(0, cleanRoadNodes.length - 2);
 
         let createdViaSdk = false;
 
         // 1. Official WME SDK segment creation
         if (wmeSDK && wmeSDK.DataModel && wmeSDK.DataModel.Segments && typeof wmeSDK.DataModel.Segments.addSegment === 'function') {
             try {
-                const geoJsonCoords = sortedPoints.map(p => [p.lon, p.lat]);
+                const geoJsonCoords = cleanRoadNodes.map(p => [p.lon, p.lat]);
                 await Promise.resolve(wmeSDK.DataModel.Segments.addSegment({
                     geometry: {
                         type: 'LineString',
@@ -2189,7 +2338,7 @@
                     roadType: 1
                 }));
                 createdViaSdk = true;
-                showToast('🛣️ Draft Street created along GPS trace! Connect junctions and save.', 'success');
+                showToast(`🛣️ Straight Street drawn (${internalNodes} intermediate node${internalNodes === 1 ? '' : 's'})! Connect & save.`, 'success');
             } catch (e) {}
         }
 
@@ -2200,7 +2349,7 @@
                 const SegmentFeature = win.require ? win.require('Waze/Feature/Vector/Segment') : (win.W.Feature && win.W.Feature.Vector && win.W.Feature.Vector.Segment);
 
                 if (AddSegmentAction && SegmentFeature && win.OpenLayers) {
-                    const olComponents = sortedPoints.map(p => {
+                    const olComponents = cleanRoadNodes.map(p => {
                         const m = latLonToMercator(p.lat, p.lon);
                         return new win.OpenLayers.Geometry.Point(m.x, m.y);
                     });
@@ -2211,69 +2360,213 @@
                     });
                     win.W.controller.actionManager.add(new AddSegmentAction(seg));
                     createdViaSdk = true;
-                    showToast('🛣️ Draft Street added! Fill in street name and connect junctions.', 'success');
+                    showToast(`🛣️ Straight Street added (${internalNodes} intermediate node${internalNodes === 1 ? '' : 's'})!`, 'success');
                 }
             } catch (e) {}
         }
 
         // 3. Fallback: activate WME road drawing tool
         if (!createdViaSdk) {
-            showToast("Centered at Zoom 18. Press 'I' or click Road tool to trace the highlighted line!", 'info');
+            showToast("Centered at Zoom 18. Press 'I' or click Road tool to trace the highlighted centerline!", 'info');
             const roadToolBtn = document.querySelector('#toolbar .toolbar-button-road, .wz-header-item-road');
             if (roadToolBtn) roadToolBtn.click();
         }
+
+        renderAlertList();
     }
 
-    function sortGpsPointsAlongTrajectory(points) {
-        if (points.length <= 2) return points;
-
+    function rdpSimplifyMeters(pts, epsilon) {
+        if (pts.length <= 2) return pts;
+        const first = pts[0];
+        const last = pts[pts.length - 1];
         let maxDist = -1;
-        let startIdx = 0;
-        for (let i = 0; i < points.length; i++) {
-            for (let j = i + 1; j < points.length; j++) {
-                const d = haversineDistanceMeters(points[i].lat, points[i].lon, points[j].lat, points[j].lon);
-                if (d > maxDist) {
-                    maxDist = d;
-                    startIdx = i;
+        let splitIdx = -1;
+
+        for (let i = 1; i < pts.length - 1; i++) {
+            const d = distanceToLineSegmentMeters(pts[i].x, pts[i].y, first.x, first.y, last.x, last.y);
+            if (d > maxDist) {
+                maxDist = d;
+                splitIdx = i;
+            }
+        }
+
+        if (maxDist > epsilon && splitIdx !== -1) {
+            const left = rdpSimplifyMeters(pts.slice(0, splitIdx + 1), epsilon);
+            const right = rdpSimplifyMeters(pts.slice(splitIdx), epsilon);
+            return left.slice(0, -1).concat(right);
+        }
+        return [first, last];
+    }
+
+    // Converts noisy/jumping GPS trace clouds into a clean, straight WME centerline with minimum geometry nodes
+    function buildMinimalNodeRoadPoints(points, toleranceMeters = 8) {
+        if (!points || points.length === 0) return [];
+        if (points.length === 1) return [{ lon: points[0].lon, lat: points[0].lat }];
+
+        const R = 6371000;
+        let lat0 = 0, lon0 = 0;
+        for (const p of points) {
+            lat0 += p.lat;
+            lon0 += p.lon;
+        }
+        lat0 /= points.length;
+        lon0 /= points.length;
+        const cosLat = Math.max(0.1, Math.cos(lat0 * Math.PI / 180));
+        const mPerDegLon = (Math.PI / 180) * R * cosLat;
+        const mPerDegLat = (Math.PI / 180) * R;
+
+        function toXY(p) {
+            return { x: (p.lon - lon0) * mPerDegLon, y: (p.lat - lat0) * mPerDegLat };
+        }
+        function toLonLat(xy) {
+            return { lon: lon0 + xy.x / mPerDegLon, lat: lat0 + xy.y / mPerDegLat };
+        }
+
+        const xyPts = points.map(toXY);
+
+        // Compute 2D PCA principal axis (orthogonal least-squares best-fit line direction)
+        let cxx = 0, cxy = 0, cyy = 0;
+        for (const p of xyPts) {
+            cxx += p.x * p.x;
+            cxy += p.x * p.y;
+            cyy += p.y * p.y;
+        }
+        const theta = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+        const ux = Math.cos(theta);
+        const uy = Math.sin(theta);
+
+        let sMin = Infinity, sMax = -Infinity, maxCrossAbs = 0;
+        const projected = xyPts.map(p => {
+            const s = p.x * ux + p.y * uy;
+            const d = -p.x * uy + p.y * ux;
+            if (s < sMin) sMin = s;
+            if (s > sMax) sMax = s;
+            if (Math.abs(d) > maxCrossAbs) maxCrossAbs = Math.abs(d);
+            return { ...p, s, d };
+        });
+
+        const totalSpan = sMax - sMin;
+        if (totalSpan < 4) {
+            return [points[0], points[points.length - 1]];
+        }
+
+        const tol = Math.max(3, toleranceMeters);
+
+        // FAST PATH 1: If all GPS scatter stays within cross-track band (<= max(9m, tol * 1.25)),
+        // the road is STRAIGHT! Return a pure 2-point orthogonal-regression segment (0 intermediate nodes!).
+        if (maxCrossAbs <= Math.max(9, tol * 1.25)) {
+            return [
+                toLonLat({ x: sMin * ux, y: sMin * uy }),
+                toLonLat({ x: sMax * ux, y: sMax * uy })
+            ];
+        }
+
+        // PATH 2: Curved or bent road — smooth out GPS jumps first, then RDP-simplify with minimal nodes!
+        let spine = [];
+        if (maxCrossAbs <= 22) {
+            // Gently curving road: bin along principal axis every ~16m to cancel lane offset & GPS scatter
+            const binCount = Math.max(2, Math.min(20, Math.round(totalSpan / 16)));
+            const binWidth = totalSpan / binCount;
+            for (let b = 0; b < binCount; b++) {
+                const lo = sMin + b * binWidth;
+                const hi = (b === binCount - 1) ? (sMax + 0.01) : (lo + binWidth);
+                const inBin = projected.filter(p => p.s >= lo && p.s <= hi);
+                if (inBin.length > 0) {
+                    const mx = inBin.reduce((acc, p) => acc + p.x, 0) / inBin.length;
+                    const my = inBin.reduce((acc, p) => acc + p.y, 0) / inBin.length;
+                    spine.push({ x: mx, y: my });
                 }
             }
-        }
+        } else {
+            // L-turn / S-bend / loop: cluster raw jitter into 15m spatial medoids, chain from extremity, & smooth
+            const cellRadius = 15;
+            const remaining = [...xyPts];
+            const centroids = [];
+            while (remaining.length > 0) {
+                const seed = remaining.shift();
+                const group = [seed];
+                for (let i = remaining.length - 1; i >= 0; i--) {
+                    const dx = remaining[i].x - seed.x;
+                    const dy = remaining[i].y - seed.y;
+                    if (Math.sqrt(dx * dx + dy * dy) <= cellRadius) {
+                        group.push(remaining.splice(i, 1)[0]);
+                    }
+                }
+                centroids.push({
+                    x: group.reduce((a, p) => a + p.x, 0) / group.length,
+                    y: group.reduce((a, p) => a + p.y, 0) / group.length
+                });
+            }
 
-        const sorted = [points[startIdx]];
-        const unvisited = new Set(points.map((_, i) => i));
-        unvisited.delete(startIdx);
-
-        while (unvisited.size > 0) {
-            const current = sorted[sorted.length - 1];
-            let nearestIdx = -1;
-            let nearestDist = Infinity;
-
-            for (const idx of unvisited) {
-                const p = points[idx];
-                const d = haversineDistanceMeters(current.lat, current.lon, p.lat, p.lon);
-                if (d < nearestDist) {
-                    nearestDist = d;
-                    nearestIdx = idx;
+            // Find the two furthest centroids to start chain at a true road end
+            let startIdx = 0, bestD = -1;
+            for (let i = 0; i < centroids.length; i++) {
+                for (let j = i + 1; j < centroids.length; j++) {
+                    const d = Math.hypot(centroids[i].x - centroids[j].x, centroids[i].y - centroids[j].y);
+                    if (d > bestD) { bestD = d; startIdx = i; }
                 }
             }
-
-            if (nearestIdx !== -1) {
-                unvisited.delete(nearestIdx);
-                sorted.push(points[nearestIdx]);
-            } else {
-                break;
+            const ordered = [centroids[startIdx]];
+            const pool = centroids.filter((_, idx) => idx !== startIdx);
+            while (pool.length > 0) {
+                const cur = ordered[ordered.length - 1];
+                let nearestI = 0, nearestDist = Infinity;
+                for (let i = 0; i < pool.length; i++) {
+                    const d = Math.hypot(pool[i].x - cur.x, pool[i].y - cur.y);
+                    if (d < nearestDist) { nearestDist = d; nearestI = i; }
+                }
+                // Stop chaining if jump is implausibly huge compared to cluster radius
+                if (nearestDist > Math.max(85, settings.clusterDistanceMeters * 1.5)) break;
+                ordered.push(pool.splice(nearestI, 1)[0]);
             }
+            spine = ordered;
         }
 
-        if (sorted.length > 8) {
-            const step = Math.floor(sorted.length / 7);
-            const simplified = [sorted[0]];
-            for (let i = step; i < sorted.length - 1; i += step) simplified.push(sorted[i]);
-            simplified.push(sorted[sorted.length - 1]);
-            return simplified;
+        if (spine.length <= 2) {
+            return spine.length === 2
+                ? [toLonLat(spine[0]), toLonLat(spine[1])]
+                : [toLonLat({ x: sMin * ux, y: sMin * uy }), toLonLat({ x: sMax * ux, y: sMax * uy })];
         }
 
-        return sorted;
+        // Laplacian smoothing pass on interior spine vertices to iron out residual GPS jumps
+        if (spine.length >= 3) {
+            const smoothed = [spine[0]];
+            for (let i = 1; i < spine.length - 1; i++) {
+                smoothed.push({
+                    x: 0.25 * spine[i - 1].x + 0.5 * spine[i].x + 0.25 * spine[i + 1].x,
+                    y: 0.25 * spine[i - 1].y + 0.5 * spine[i].y + 0.25 * spine[i + 1].y
+                });
+            }
+            smoothed.push(spine[spine.length - 1]);
+            spine = smoothed;
+        }
+
+        // Ramer-Douglas-Peucker simplification for minimum geometric nodes
+        let simplified = rdpSimplifyMeters(spine, tol);
+
+        // Prune near-collinear bends (< 12 degrees) and micro-legs (< 16m)
+        if (simplified.length > 2) {
+            const pruned = [simplified[0]];
+            for (let i = 1; i < simplified.length - 1; i++) {
+                const prev = pruned[pruned.length - 1];
+                const curr = simplified[i];
+                const next = simplified[i + 1];
+                const v1x = curr.x - prev.x, v1y = curr.y - prev.y;
+                const v2x = next.x - curr.x, v2y = next.y - curr.y;
+                const len1 = Math.hypot(v1x, v1y);
+                const len2 = Math.hypot(v2x, v2y);
+                if (len1 < 16 || len2 < 16) continue;
+                const cosAngle = (v1x * v2x + v1y * v2y) / (len1 * len2);
+                const angleDeg = Math.acos(Math.max(-1, Math.min(1, cosAngle))) * (180 / Math.PI);
+                if (angleDeg >= 12) {
+                    pruned.push(curr);
+                }
+            }
+            pruned.push(simplified[simplified.length - 1]);
+            simplified = pruned;
+        }
+
+        return simplified.map(toLonLat);
     }
 
     /* ==========================================================================
@@ -2414,6 +2707,7 @@
 
     async function zoomTo18AndScan() {
         const targetZoom = Math.max(18, getCurrentZoom(), settings.zoomMinRequired || 18);
+        suppressAutoScanUntil = Date.now() + 2500;
         const extent = getMapExtent();
         if (extent) {
             const cLat = (extent.minLat + extent.maxLat) / 2;
@@ -2427,7 +2721,7 @@
         updateStatusText(`Zoomed to level ${getCurrentZoom()}... waiting for GPS traces to load...`);
         setTimeout(() => {
             updateZoomPill();
-            runScanner();
+            runScanner({ isManualScan: true });
         }, 1400);
     }
 
@@ -2453,17 +2747,94 @@
 
     function copyAllPermalinks() {
         if (currentResults.stretches.length === 0) {
-            showToast('No missing road stretches to copy.', 'warning');
+            showToast('No missing road stretches in queue to copy.', 'warning');
             return;
         }
 
-        let output = `=== WME Need a Road! Missing Roads Report (${currentResults.stretches.length} Stretches) ===\n\n`;
+        let output = `=== WME Need a Road! Compiled Queue (${currentResults.stretches.length} Stretches) ===\n\n`;
         currentResults.stretches.forEach((s) => {
-            output += `Stretch #${s.id} (${s.pointCount} GPS samples, ~${s.approxLengthMeters}m):\n${s.permalink}\n\n`;
+            output += `Stretch #${s.id} (~${s.approxLengthMeters}m, ${s.pointCount} pts):\n${s.permalink}\n\n`;
         });
 
         copyToClipboard(output);
         showToast(`Copied ${currentResults.stretches.length} Zoom 18 permalinks to clipboard!`, 'success');
+    }
+
+    function exportQueueToCsv() {
+        if (currentResults.stretches.length === 0) {
+            showToast('Queue is empty — nothing to export.', 'warning');
+            return;
+        }
+
+        const rows = ['Stretch_ID,Approx_Length_m,GPS_Points,Latitude,Longitude,Source_Area,Permalink'];
+        currentResults.stretches.forEach((s) => {
+            const safeArea = String(s.sourceArea || '').replace(/"/g, '""');
+            rows.push(`${s.id},${s.approxLengthMeters},${s.pointCount},${s.centerLat.toFixed(6)},${s.centerLon.toFixed(6)},"${safeArea}","${s.permalink}"`);
+        });
+
+        const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const dateTag = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `wme-need-a-road-queue-${dateTag}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+        showToast(`💾 Exported ${currentResults.stretches.length} stretch(es) to CSV!`, 'success');
+    }
+
+    function clearCompiledQueue() {
+        if (currentResults.stretches.length === 0) {
+            showToast('Compiled queue is already empty.', 'info');
+            return;
+        }
+        currentResults.stretches = [];
+        activeStretchIndex = 0;
+        saveCompiledQueue();
+        clearHighlights();
+        renderAlertList();
+        updateStatusText('🗑️ Compiled queue cleared. Ready for a new scan.');
+        showToast('Compiled queue cleared.', 'info');
+    }
+
+    function resolveStretchById(stretchId, markDismissed = false) {
+        const idx = currentResults.stretches.findIndex(s => s.id === stretchId);
+        if (idx === -1) return;
+        const stretch = currentResults.stretches[idx];
+
+        if (markDismissed) {
+            const key = `${stretch.centerLat.toFixed(4)}_${stretch.centerLon.toFixed(4)}`;
+            dismissedStretches.add(key);
+            saveDismissed();
+            const resetBtn = document.getElementById('nar-btn-reset-dismissed');
+            if (resetBtn) resetBtn.textContent = `🔄 Reset Dismissed (${dismissedStretches.size})`;
+        }
+
+        currentResults.stretches.splice(idx, 1);
+        reindexStretches();
+        saveCompiledQueue();
+        renderAlertList();
+        renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+
+        if (markDismissed) {
+            showToast(`✖️ Stretch dismissed (${currentResults.stretches.length} left in queue).`, 'info');
+        } else {
+            showToast(`✅ Marked done! (${currentResults.stretches.length} left in queue).`, 'success');
+        }
+    }
+
+    async function jumpToStretchByIndex(idx) {
+        if (currentResults.stretches.length === 0) return;
+        activeStretchIndex = ((idx % currentResults.stretches.length) + currentResults.stretches.length) % currentResults.stretches.length;
+        const stretch = currentResults.stretches[activeStretchIndex];
+        saveCompiledQueue();
+        renderAlertList();
+        suppressAutoScanUntil = Date.now() + 2600;
+        if (crawlerState.status === 'running') pauseGridCrawler();
+        await goToLocationAndVerifyZoom(stretch.centerLat, stretch.centerLon, 18);
+        renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
     }
 
     /* ==========================================================================
@@ -2629,11 +3000,11 @@
                 continue;
             }
 
-            const ordered = sortGpsPointsAlongTrajectory(stretch.points);
-            if (ordered.length > 1) {
+            const cleanLine = buildMinimalNodeRoadPoints(stretch.points, settings.drawSimplifyToleranceMeters || 8);
+            if (cleanLine.length > 1) {
                 let pathData = '';
-                for (let i = 0; i < ordered.length; i++) {
-                    const p = coordsToPixel(ordered[i].lon, ordered[i].lat);
+                for (let i = 0; i < cleanLine.length; i++) {
+                    const p = coordsToPixel(cleanLine[i].lon, cleanLine[i].lat);
                     if (!p) continue;
                     pathData += (pathData === '' ? `M ${p.x.toFixed(1)} ${p.y.toFixed(1)}` : ` L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`);
                 }
@@ -2653,7 +3024,8 @@
             g.setAttribute('transform', `translate(${centerPixel.x.toFixed(1)}, ${(centerPixel.y - 18).toFixed(1)})`);
             g.setAttribute('style', 'pointer-events: auto; cursor: pointer;');
             g.onclick = () => {
-                goToLocationAndVerifyZoom(stretch.centerLat, stretch.centerLon, 18);
+                const sIdx = currentResults.stretches.findIndex(item => item.id === stretch.id);
+                if (sIdx >= 0) jumpToStretchByIndex(sIdx);
                 focusAlertCard(stretch.id);
             };
 
@@ -2685,8 +3057,126 @@
     }
 
     /* ==========================================================================
-       11. USER INTERFACE & CRAWLER CONTROLS
+       11. DRAGGABLE UI, COMPACT FIXER MINI-WINDOW & COMPILED QUEUE
        ========================================================================== */
+    function applySavedPanelPosition(panel) {
+        if (!panel) return;
+        const vw = win.innerWidth || 1280;
+        const vh = win.innerHeight || 800;
+        const pw = panel.offsetWidth || (settings.uiMode === 'compact' ? 276 : 356);
+
+        if (Number.isFinite(settings.panelLeft) && Number.isFinite(settings.panelTop)) {
+            const clampedLeft = Math.max(8, Math.min(vw - Math.min(pw, 260) - 8, settings.panelLeft));
+            const clampedTop = Math.max(8, Math.min(vh - 46, settings.panelTop));
+            panel.style.left = `${Math.round(clampedLeft)}px`;
+            panel.style.top = `${Math.round(clampedTop)}px`;
+            panel.style.right = 'auto';
+        } else {
+            panel.style.top = '85px';
+            panel.style.right = '20px';
+            panel.style.left = 'auto';
+        }
+    }
+
+    function makePanelDraggable(panel, header) {
+        let dragging = false;
+        let hasMoved = false;
+        let startX = 0, startY = 0;
+        let origLeft = 0, origTop = 0;
+
+        header.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0) return;
+            // Don't start drag when clicking interactive pills/buttons inside header
+            if (e.target.closest('.nar-hdr-ctrl')) return;
+
+            dragging = true;
+            hasMoved = false;
+            const rect = panel.getBoundingClientRect();
+            startX = e.clientX;
+            startY = e.clientY;
+            origLeft = rect.left;
+            origTop = rect.top;
+            header.style.cursor = 'grabbing';
+            try { header.setPointerCapture(e.pointerId); } catch (err) {}
+        });
+
+        header.addEventListener('pointermove', (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            if (!hasMoved && Math.hypot(dx, dy) > 4) {
+                hasMoved = true;
+            }
+            if (!hasMoved) return;
+
+            const vw = win.innerWidth || 1280;
+            const vh = win.innerHeight || 800;
+            const pw = panel.offsetWidth || 276;
+            const newLeft = Math.max(6, Math.min(vw - pw - 6, origLeft + dx));
+            const newTop = Math.max(6, Math.min(vh - 44, origTop + dy));
+
+            panel.style.left = `${Math.round(newLeft)}px`;
+            panel.style.top = `${Math.round(newTop)}px`;
+            panel.style.right = 'auto';
+        });
+
+        function finishDrag(e) {
+            if (!dragging) return;
+            dragging = false;
+            header.style.cursor = 'grab';
+            try { header.releasePointerCapture(e.pointerId); } catch (err) {}
+
+            if (hasMoved) {
+                const rect = panel.getBoundingClientRect();
+                settings.panelLeft = Math.round(rect.left);
+                settings.panelTop = Math.round(rect.top);
+                saveSettings();
+                // Suppress click toggle immediately following a drag gesture
+                header._justDraggedAt = Date.now();
+            }
+        }
+
+        header.addEventListener('pointerup', finishDrag);
+        header.addEventListener('pointercancel', finishDrag);
+
+        win.addEventListener('resize', () => applySavedPanelPosition(panel));
+    }
+
+    function setUiMode(mode) {
+        const panel = document.getElementById('wme-need-a-road-panel');
+        const fullBody = document.getElementById('wme-need-a-road-body');
+        const compactBody = document.getElementById('wme-need-a-road-compact');
+        const modeBtn = document.getElementById('nar-mode-btn');
+        const toggleIcon = document.getElementById('nar-toggle-btn');
+
+        settings.uiMode = (mode === 'compact') ? 'compact' : 'full';
+        settings.panelCollapsed = false;
+        saveSettings();
+
+        if (!panel) return;
+
+        if (settings.uiMode === 'compact') {
+            panel.classList.add('nar-compact-mode');
+            if (fullBody) fullBody.style.display = 'none';
+            if (compactBody) compactBody.style.display = 'block';
+            if (modeBtn) {
+                modeBtn.textContent = '⤢';
+                modeBtn.title = 'Expand to Full Panel & Queue List';
+            }
+        } else {
+            panel.classList.remove('nar-compact-mode');
+            if (compactBody) compactBody.style.display = 'none';
+            if (fullBody) fullBody.style.display = 'block';
+            if (modeBtn) {
+                modeBtn.textContent = '⤡';
+                modeBtn.title = 'Shrink to Compact Fixer Bar';
+            }
+        }
+        if (toggleIcon) toggleIcon.textContent = '▼';
+        applySavedPanelPosition(panel);
+        renderCompactFixer();
+    }
+
     function injectUI() {
         if (document.getElementById('wme-need-a-road-panel')) return;
 
@@ -2706,57 +3196,102 @@
                 font-size: 13px;
                 overflow: hidden;
                 border: 1px solid #334155;
+                transition: width 0.16s ease;
+            }
+            #wme-need-a-road-panel.nar-compact-mode {
+                width: 276px;
             }
             #wme-need-a-road-header {
                 background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
-                padding: 10px 14px;
+                padding: 8px 11px;
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                cursor: pointer;
+                cursor: grab;
                 user-select: none;
+                touch-action: none;
             }
             #wme-need-a-road-header h4 {
                 margin: 0;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 700;
                 display: flex;
                 align-items: center;
-                gap: 6px;
+                gap: 5px;
                 color: #ffffff;
+                white-space: nowrap;
             }
+            .nar-hdr-btn {
+                background: rgba(15, 23, 42, 0.32);
+                color: #fff;
+                border: 1px solid rgba(255,255,255,0.28);
+                border-radius: 5px;
+                padding: 1px 6px;
+                font-size: 12px;
+                line-height: 16px;
+                cursor: pointer;
+                font-weight: 700;
+            }
+            .nar-hdr-btn:hover { background: rgba(15, 23, 42, 0.55); }
             .nar-badge {
                 background: #ff2d55;
                 color: #fff;
                 border-radius: 10px;
-                padding: 1px 7px;
+                padding: 1px 6px;
                 font-size: 11px;
                 font-weight: bold;
             }
             .nar-zoom-pill {
                 background: rgba(0,0,0,0.3);
-                color: #38bdf8;
-                border: 1px solid #38bdf8;
+                color: #e0f2fe;
+                border: 1px solid rgba(224,242,254,0.6);
                 border-radius: 10px;
-                padding: 2px 7px;
-                font-size: 10.5px;
+                padding: 1px 6px;
+                font-size: 10px;
                 font-weight: 600;
                 cursor: pointer;
+                white-space: nowrap;
             }
             .nar-zoom-pill.nar-zoom-warning {
-                color: #fbbf24;
+                color: #fde68a;
                 border-color: #fbbf24;
-                background: rgba(245, 158, 11, 0.22);
+                background: rgba(245, 158, 11, 0.3);
             }
             #wme-need-a-road-body {
-                padding: 12px;
-                max-height: 550px;
+                padding: 11px;
+                max-height: 520px;
                 overflow-y: auto;
+            }
+            #wme-need-a-road-compact {
+                padding: 9px 10px;
+                background: #151c28;
+            }
+            .nar-compact-nav {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 6px;
+                margin-bottom: 7px;
+            }
+            .nar-compact-info {
+                flex: 1;
+                text-align: center;
+                font-size: 11.5px;
+                font-weight: 700;
+                color: #f8fafc;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .nar-compact-sub {
+                font-size: 10px;
+                color: #94a3b8;
+                font-weight: 500;
             }
             .nar-btn-row {
                 display: flex;
                 gap: 6px;
-                margin-bottom: 10px;
+                margin-bottom: 9px;
             }
             .nar-btn {
                 flex: 1;
@@ -2764,7 +3299,7 @@
                 color: #fff;
                 border: none;
                 border-radius: 6px;
-                padding: 7px 8px;
+                padding: 6px 7px;
                 font-size: 11px;
                 font-weight: 600;
                 cursor: pointer;
@@ -2804,15 +3339,15 @@
             .nar-stats {
                 background: #0f172a;
                 border-radius: 8px;
-                padding: 8px 10px;
-                margin-bottom: 10px;
+                padding: 7px 10px;
+                margin-bottom: 9px;
                 font-size: 11px;
                 display: flex;
                 justify-content: space-around;
                 border: 1px solid #1e293b;
             }
             .nar-stat-item { text-align: center; }
-            .nar-stat-num { font-size: 14px; font-weight: bold; color: #38bdf8; }
+            .nar-stat-num { font-size: 13.5px; font-weight: bold; color: #38bdf8; }
             .nar-stat-label { color: #94a3b8; font-size: 10px; }
             .nar-status-box {
                 font-size: 11px;
@@ -2821,47 +3356,66 @@
                 border-left: 3px solid #0284c7;
                 padding: 6px 8px;
                 border-radius: 4px;
-                margin-bottom: 10px;
-                min-height: 26px;
+                margin-bottom: 8px;
+                min-height: 24px;
                 display: flex;
                 align-items: center;
+            }
+            .nar-queue-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 5px;
+                margin-bottom: 8px;
+                padding: 5px 7px;
+                background: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                font-size: 11px;
             }
             .nar-crawler-box {
                 background: #131b2e;
                 border: 1px solid #3b82f6;
                 border-radius: 8px;
                 padding: 9px;
-                margin-bottom: 10px;
+                margin-bottom: 9px;
             }
             .nar-alert-list {
                 display: flex;
                 flex-direction: column;
-                gap: 8px;
+                gap: 7px;
+                max-height: 230px;
+                overflow-y: auto;
+                padding-right: 2px;
             }
             .nar-alert-card {
                 background: #182234;
                 border: 1px solid #334155;
                 border-left: 4px solid #ff2d55;
                 border-radius: 6px;
-                padding: 8px;
+                padding: 7px 8px;
                 transition: transform 0.1s, border-color 0.1s;
+            }
+            .nar-alert-card.nar-card-active {
+                border-color: #38bdf8;
+                background: #1d2a40;
             }
             .nar-alert-card:hover { border-color: #ff2d55; }
             .nar-alert-header {
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-bottom: 4px;
+                margin-bottom: 3px;
             }
             .nar-alert-title { font-weight: 700; color: #f8fafc; font-size: 12px; }
-            .nar-alert-meta { font-size: 10.5px; color: #94a3b8; margin-bottom: 7px; }
-            .nar-card-actions { display: flex; gap: 5px; }
+            .nar-alert-meta { font-size: 10.5px; color: #94a3b8; margin-bottom: 6px; }
+            .nar-card-actions { display: flex; gap: 4px; }
             .nar-action-btn {
                 background: #334155;
                 color: #f1f5f9;
                 border: none;
                 border-radius: 4px;
-                padding: 4px 6px;
+                padding: 4px 5px;
                 font-size: 10.5px;
                 cursor: pointer;
                 flex: 1;
@@ -2869,16 +3423,18 @@
                 text-align: center;
             }
             .nar-action-btn:hover { background: #475569; }
-            .nar-action-btn-draw { background: #10b981; color: #fff; }
+            .nar-action-btn-draw { background: #10b981; color: #fff; flex: 1.25; }
             .nar-action-btn-draw:hover { background: #059669; }
-            .nar-action-btn-dismiss { background: #475569; color: #94a3b8; flex: 0.5; }
-            .nar-action-btn-dismiss:hover { background: #64748b; color: #fff; }
+            .nar-action-btn-done { background: #0284c7; color: #fff; flex: 0.9; }
+            .nar-action-btn-done:hover { background: #0369a1; }
+            .nar-action-btn-dismiss { background: #475569; color: #cbd5e1; flex: 0.45; }
+            .nar-action-btn-dismiss:hover { background: #dc2626; color: #fff; }
             .nar-settings-toggle {
                 font-size: 11px;
                 color: #38bdf8;
                 cursor: pointer;
                 text-align: right;
-                margin-top: 10px;
+                margin-top: 9px;
                 user-select: none;
             }
             .nar-settings-drawer {
@@ -2896,7 +3452,7 @@
                 margin-bottom: 6px;
             }
             .nar-setting-row input[type="number"] {
-                width: 68px;
+                width: 66px;
                 background: #1e293b;
                 border: 1px solid #475569;
                 color: #fff;
@@ -2920,18 +3476,43 @@
         `;
         document.head.appendChild(style);
 
+        const isCompactInit = settings.uiMode === 'compact' && !settings.panelCollapsed;
         const panel = document.createElement('div');
         panel.id = 'wme-need-a-road-panel';
+        if (isCompactInit) panel.classList.add('nar-compact-mode');
+
         panel.innerHTML = `
-            <div id="wme-need-a-road-header">
-                <h4>🛣️ ${SCRIPT_NAME}</h4>
-                <div style="display:flex; align-items:center; gap:8px;">
-                    <span id="nar-zoom-pill" class="nar-zoom-pill" title="Click to zoom to level 18">Zoom 18</span>
+            <div id="wme-need-a-road-header" title="Drag to move anywhere on screen">
+                <h4>⠿ 🛣️ ${SCRIPT_NAME}</h4>
+                <div style="display:flex; align-items:center; gap:5px;">
+                    <span id="nar-zoom-pill" class="nar-zoom-pill nar-hdr-ctrl" title="Click to zoom to level 18">Z18</span>
                     <span id="nar-stretch-count" class="nar-badge" style="display:none;">0</span>
-                    <span id="nar-toggle-btn" style="color:#fff; font-size:14px;">${settings.panelCollapsed ? '▲' : '▼'}</span>
+                    <button id="nar-mode-btn" class="nar-hdr-btn nar-hdr-ctrl" title="${isCompactInit ? 'Expand to Full Panel' : 'Shrink to Compact Fixer Bar'}">${isCompactInit ? '⤢' : '⤡'}</button>
+                    <button id="nar-toggle-btn" class="nar-hdr-btn nar-hdr-ctrl" title="Minimize / Restore">${settings.panelCollapsed ? '▲' : '▼'}</button>
                 </div>
             </div>
-            <div id="wme-need-a-road-body" style="display:${settings.panelCollapsed ? 'none' : 'block'};">
+
+            <!-- COMPACT DRAGGABLE FIXER WINDOW (Minimal footprint while editing roads!) -->
+            <div id="wme-need-a-road-compact" style="display:${(!settings.panelCollapsed && isCompactInit) ? 'block' : 'none'};">
+                <div class="nar-compact-nav">
+                    <button id="nar-cmp-prev" class="nar-icon-btn" title="Previous Stretch in Queue">◀</button>
+                    <div class="nar-compact-info">
+                        <div id="nar-cmp-title">Queue Empty</div>
+                        <div id="nar-cmp-sub" class="nar-compact-sub">Click ⤢ to scan an area</div>
+                    </div>
+                    <button id="nar-cmp-next" class="nar-icon-btn" title="Next Stretch in Queue">▶</button>
+                </div>
+                <div class="nar-card-actions">
+                    <button id="nar-cmp-goto" class="nar-action-btn" title="Center map on this stretch at Zoom 18">🎯 Go</button>
+                    <button id="nar-cmp-draw" class="nar-action-btn nar-action-btn-draw" title="Draw straight minimal-node Street">🛣️ Draw</button>
+                    <button id="nar-cmp-done" class="nar-action-btn nar-action-btn-done" title="Mark resolved & advance to next">✅ Done</button>
+                    <button id="nar-cmp-copy" class="nar-action-btn" style="flex:0.55;" title="Copy Permalink">🔗</button>
+                    <button id="nar-cmp-dismiss" class="nar-action-btn nar-action-btn-dismiss" title="Dismiss as false positive">✖️</button>
+                </div>
+            </div>
+
+            <!-- FULL CONTROL & COMPILED QUEUE PANEL -->
+            <div id="wme-need-a-road-body" style="display:${(!settings.panelCollapsed && !isCompactInit) ? 'block' : 'none'};">
                 <div class="nar-btn-row">
                     <button id="nar-btn-scan" class="nar-btn">
                         <span>🔍</span> Scan View
@@ -2939,22 +3520,22 @@
                     <button id="nar-btn-layers" class="nar-btn nar-btn-secondary" title="Turn on ROADS and GPS layers (Shift+G)">
                         <span>👁️</span> Layers ON
                     </button>
-                    <button id="nar-btn-copyall" class="nar-btn nar-btn-copyall" title="Copy all Zoom 18 permalinks to clipboard">
-                        <span>📋</span> Copy All PLs
+                    <button id="nar-btn-copyall" class="nar-btn nar-btn-copyall" title="Copy all compiled Zoom 18 permalinks">
+                        <span>📋</span> Copy PLs
                     </button>
                 </div>
 
-                <!-- Permission Bounded Crawler Section -->
+                <!-- Area Crawler Section (4 km², 20 km², Editable Areas, Viewport) -->
                 <div class="nar-crawler-box">
                     <div style="font-weight:bold; font-size:11px; margin-bottom:5px; color:#38bdf8; display:flex; justify-content:space-between; align-items:center;">
-                        <span id="nar-crawler-title">🌐 Editable Area Crawler (Zoom ${settings.crawlerZoomLevel}+)</span>
+                        <span id="nar-crawler-title">🌐 Area Scanner (Zoom ${settings.crawlerZoomLevel}+)</span>
                         <span id="nar-crawler-progress-label" style="color:#94a3b8; font-weight:normal;"></span>
                     </div>
                     <div style="display:flex; gap:5px; margin-bottom:7px;">
                         <select id="nar-crawler-area-select" style="flex:1; min-width:0; background:#1e293b; color:#fff; border:1px solid #475569; border-radius:4px; padding:4px; font-size:11px;">
-                            <option value="0" data-area-id="current_viewport">📍 Current Viewport (Screen)</option>
+                            <option value="0" data-area-id="scan_area_4km2">🗺️ Surrounding Window (4 km²)</option>
                         </select>
-                        <button id="nar-btn-refresh-areas" class="nar-icon-btn" title="Reload Editable & Managed Areas">🔄</button>
+                        <button id="nar-btn-refresh-areas" class="nar-icon-btn" title="Reload Editable & Window Scan Areas">🔄</button>
                     </div>
                     <div class="nar-btn-row" style="margin-bottom:0;">
                         <button id="nar-btn-crawler-start" class="nar-btn nar-btn-crawler">
@@ -2978,7 +3559,7 @@
                 <div class="nar-stats">
                     <div class="nar-stat-item">
                         <div id="nar-stat-gps" class="nar-stat-num">0</div>
-                        <div class="nar-stat-label">GPS Samples</div>
+                        <div class="nar-stat-label">View GPS</div>
                     </div>
                     <div class="nar-stat-item">
                         <div id="nar-stat-covered" class="nar-stat-num" style="color:#10b981;">0</div>
@@ -2986,12 +3567,22 @@
                     </div>
                     <div class="nar-stat-item">
                         <div id="nar-stat-unmapped" class="nar-stat-num" style="color:#ff2d55;">0</div>
-                        <div class="nar-stat-label">No Road</div>
+                        <div class="nar-stat-label">Saved Queue</div>
                     </div>
                 </div>
 
                 <div id="nar-status" class="nar-status-box">
-                    Ready. Click 'Scan View' or 'Start Area Crawl'.
+                    Ready. Pick 4 km², 20 km², or Editable Area to scan!
+                </div>
+
+                <!-- Persistent Compiled Queue Toolbar -->
+                <div id="nar-queue-toolbar" class="nar-queue-bar" style="display:none;">
+                    <span id="nar-queue-summary" style="color:#e2e8f0; font-weight:600;">📋 0 Queued</span>
+                    <div style="display:flex; gap:4px;">
+                        <button id="nar-btn-export-csv" class="nar-icon-btn" title="Download compiled queue as CSV spreadsheet">💾 CSV</button>
+                        <button id="nar-btn-mini-work" class="nar-icon-btn" style="background:#0284c7; border-color:#38bdf8;" title="Switch to small draggable Fixer Bar">⤡ Work Mode</button>
+                        <button id="nar-btn-clear-queue" class="nar-icon-btn" title="Clear all stretches from saved queue">🗑️ Clear</button>
+                    </div>
                 </div>
 
                 <div id="nar-alerts-container" class="nar-alert-list"></div>
@@ -3007,6 +3598,10 @@
                         <input type="number" id="nar-cfg-thresh" value="${settings.proximityThresholdMeters}" min="2" max="60" step="1" />
                     </div>
                     <div class="nar-setting-row">
+                        <span>Draw Straightening (Meters):</span>
+                        <input type="number" id="nar-cfg-straighten" value="${settings.drawSimplifyToleranceMeters}" min="3" max="25" step="1" title="Higher = straighter roads with fewer geometry nodes" />
+                    </div>
+                    <div class="nar-setting-row">
                         <span>Min GPS Points/Stretch:</span>
                         <input type="number" id="nar-cfg-minpts" value="${settings.minPointsPerStretch}" min="1" max="20" step="1" />
                     </div>
@@ -3019,6 +3614,10 @@
                         <input type="number" id="nar-cfg-delay" value="${settings.crawlerStepDelayMs}" min="1000" max="5000" step="100" />
                     </div>
                     <div class="nar-setting-row">
+                        <span>Shrink to Mini Window after scan:</span>
+                        <input type="checkbox" id="nar-cfg-autocompact" ${settings.autoCompactAfterScan ? 'checked' : ''} />
+                    </div>
+                    <div class="nar-setting-row">
                         <span>Auto-scan on map pan (Z18+):</span>
                         <input type="checkbox" id="nar-cfg-autoscan" ${settings.autoScanOnMove ? 'checked' : ''} />
                     </div>
@@ -3028,28 +3627,66 @@
                     </div>
                     <div style="display:flex; justify-content:space-between; gap:6px; margin-top:8px;">
                         <button id="nar-btn-reset-dismissed" class="nar-action-btn" style="padding:4px 6px;">🔄 Reset Dismissed (${dismissedStretches.size})</button>
-                        <button id="nar-btn-clear" class="nar-action-btn" style="padding:4px 6px;">🧹 Clear Overlays</button>
+                        <button id="nar-btn-clear" class="nar-action-btn" style="padding:4px 6px;">🧹 Hide Overlays</button>
                     </div>
                 </div>
             </div>
         `;
 
         document.body.appendChild(panel);
+        const headerEl = document.getElementById('wme-need-a-road-header');
+        makePanelDraggable(panel, headerEl);
+        applySavedPanelPosition(panel);
 
-        // Bind Events
-        document.getElementById('wme-need-a-road-header').onclick = (e) => {
-            if (e.target.id === 'nar-zoom-pill') return;
+        // Header Controls
+        headerEl.onclick = (e) => {
+            if (headerEl._justDraggedAt && Date.now() - headerEl._justDraggedAt < 250) return;
+            if (e.target.closest('.nar-hdr-ctrl')) return;
             togglePanel();
+        };
+        document.getElementById('nar-toggle-btn').onclick = (e) => {
+            e.stopPropagation();
+            togglePanel();
+        };
+        document.getElementById('nar-mode-btn').onclick = (e) => {
+            e.stopPropagation();
+            setUiMode(settings.uiMode === 'compact' ? 'full' : 'compact');
         };
         document.getElementById('nar-zoom-pill').onclick = (e) => {
             e.stopPropagation();
             zoomTo18AndScan();
         };
+
+        // Compact Fixer Window Bindings
+        document.getElementById('nar-cmp-prev').onclick = () => jumpToStretchByIndex(activeStretchIndex - 1);
+        document.getElementById('nar-cmp-next').onclick = () => jumpToStretchByIndex(activeStretchIndex + 1);
+        document.getElementById('nar-cmp-goto').onclick = () => jumpToStretchByIndex(activeStretchIndex);
+        document.getElementById('nar-cmp-draw').onclick = () => {
+            const s = currentResults.stretches[activeStretchIndex];
+            if (s) drawDraftRoad(s.id);
+        };
+        document.getElementById('nar-cmp-done').onclick = () => {
+            const s = currentResults.stretches[activeStretchIndex];
+            if (s) resolveStretchById(s.id, false);
+        };
+        document.getElementById('nar-cmp-copy').onclick = () => {
+            const s = currentResults.stretches[activeStretchIndex];
+            if (s) {
+                copyToClipboard(s.permalink);
+                showToast(`Copied Stretch #${s.id} permalink!`, 'success');
+            }
+        };
+        document.getElementById('nar-cmp-dismiss').onclick = () => {
+            const s = currentResults.stretches[activeStretchIndex];
+            if (s) resolveStretchById(s.id, true);
+        };
+
+        // Main Panel Bindings
         document.getElementById('nar-btn-scan').onclick = () => {
             if (getCurrentZoom() < 18) {
                 zoomTo18AndScan();
             } else {
-                runScanner();
+                runScanner({ isManualScan: true });
             }
         };
         document.getElementById('nar-btn-layers').onclick = () => {
@@ -3058,6 +3695,9 @@
             if (getCurrentZoom() >= 18) debounceScan(500);
         };
         document.getElementById('nar-btn-copyall').onclick = copyAllPermalinks;
+        document.getElementById('nar-btn-export-csv').onclick = exportQueueToCsv;
+        document.getElementById('nar-btn-mini-work').onclick = () => setUiMode('compact');
+        document.getElementById('nar-btn-clear-queue').onclick = clearCompiledQueue;
 
         document.getElementById('nar-btn-refresh-areas').onclick = () => {
             populateAreaPicker(true);
@@ -3065,7 +3705,6 @@
         document.getElementById('nar-crawler-area-select').onchange = (e) => {
             const chosenId = e.target.options[e.target.selectedIndex]?.dataset?.areaId || null;
             if (crawlerState.status === 'stopped' && chosenId !== crawlerState.selectedAreaId) {
-                // Switching to a different area while stopped resets buttons to Start Area Crawl
                 crawlerState.status = 'idle';
                 updateCrawlerProgress('');
                 updateCrawlerUI();
@@ -3080,7 +3719,7 @@
 
         document.getElementById('nar-btn-clear').onclick = () => {
             clearHighlights();
-            showToast('Highlights cleared.', 'info');
+            showToast('Map highlights hidden (queue preserved).', 'info');
         };
         document.getElementById('nar-btn-reset-dismissed').onclick = () => {
             dismissedStretches.clear();
@@ -3104,12 +3743,17 @@
             settings.crawlerZoomLevel = val;
             saveSettings();
             const titleEl = document.getElementById('nar-crawler-title');
-            if (titleEl) titleEl.textContent = `🌐 Editable Area Crawler (Zoom ${val}+)`;
+            if (titleEl) titleEl.textContent = `🌐 Area Scanner (Zoom ${val}+)`;
         };
         document.getElementById('nar-cfg-thresh').onchange = (e) => {
             settings.proximityThresholdMeters = Math.max(2, parseFloat(e.target.value) || 6);
             saveSettings();
             if (getCurrentZoom() >= 18) debounceScan(250);
+        };
+        document.getElementById('nar-cfg-straighten').onchange = (e) => {
+            settings.drawSimplifyToleranceMeters = Math.max(3, Math.min(25, parseFloat(e.target.value) || 8));
+            saveSettings();
+            renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
         };
         document.getElementById('nar-cfg-minpts').onchange = (e) => {
             settings.minPointsPerStretch = Math.max(1, parseInt(e.target.value, 10) || 3);
@@ -3125,6 +3769,10 @@
             settings.crawlerStepDelayMs = Math.max(800, parseInt(e.target.value, 10) || 1800);
             saveSettings();
         };
+        document.getElementById('nar-cfg-autocompact').onchange = (e) => {
+            settings.autoCompactAfterScan = e.target.checked;
+            saveSettings();
+        };
         document.getElementById('nar-cfg-autoscan').onchange = (e) => {
             settings.autoScanOnMove = e.target.checked;
             saveSettings();
@@ -3137,6 +3785,7 @@
         populateAreaPicker();
         updateZoomPill();
         updateCrawlerUI();
+        renderAlertList();
     }
 
     function updateZoomPill() {
@@ -3146,16 +3795,16 @@
 
         const z = getCurrentZoom();
         if (z < 18) {
-            pill.className = 'nar-zoom-pill nar-zoom-warning';
-            pill.textContent = `Zoom ${z} ⚠️`;
+            pill.className = 'nar-zoom-pill nar-zoom-warning nar-hdr-ctrl';
+            pill.textContent = `Z${z} ⚠️`;
             pill.title = `Current zoom is ${z}. GPS traces require Zoom 18+. Click to zoom to 18!`;
             if (btn && !isScanning) {
                 btn.className = 'nar-btn nar-btn-zoom18';
-                btn.innerHTML = '<span>🔍</span> Zoom to 18 &amp; Scan';
+                btn.innerHTML = '<span>🔍</span> Zoom 18 &amp; Scan';
             }
         } else {
-            pill.className = 'nar-zoom-pill';
-            pill.textContent = `Zoom ${z} ✅`;
+            pill.className = 'nar-zoom-pill nar-hdr-ctrl';
+            pill.textContent = `Z${z} ✅`;
             pill.title = `Zoom ${z} active — GPS traces load at Zoom 18+.`;
             if (btn && !isScanning) {
                 btn.className = 'nar-btn';
@@ -3165,16 +3814,24 @@
     }
 
     function togglePanel() {
-        const body = document.getElementById('wme-need-a-road-body');
+        const fullBody = document.getElementById('wme-need-a-road-body');
+        const compactBody = document.getElementById('wme-need-a-road-compact');
         const toggleIcon = document.getElementById('nar-toggle-btn');
-        if (body.style.display === 'none') {
-            body.style.display = 'block';
-            toggleIcon.textContent = '▼';
-            settings.panelCollapsed = false;
+
+        settings.panelCollapsed = !settings.panelCollapsed;
+        if (settings.panelCollapsed) {
+            if (fullBody) fullBody.style.display = 'none';
+            if (compactBody) compactBody.style.display = 'none';
+            if (toggleIcon) toggleIcon.textContent = '▲';
         } else {
-            body.style.display = 'none';
-            toggleIcon.textContent = '▲';
-            settings.panelCollapsed = true;
+            if (settings.uiMode === 'compact') {
+                if (compactBody) compactBody.style.display = 'block';
+                if (fullBody) fullBody.style.display = 'none';
+            } else {
+                if (fullBody) fullBody.style.display = 'block';
+                if (compactBody) compactBody.style.display = 'none';
+            }
+            if (toggleIcon) toggleIcon.textContent = '▼';
         }
         saveSettings();
     }
@@ -3188,7 +3845,7 @@
             btn.innerHTML = '<span>⏳</span> Scanning...';
         } else if (z < 18) {
             btn.className = 'nar-btn nar-btn-zoom18';
-            btn.innerHTML = '<span>🔍</span> Zoom to 18 &amp; Scan';
+            btn.innerHTML = '<span>🔍</span> Zoom 18 &amp; Scan';
         } else {
             btn.className = 'nar-btn';
             btn.innerHTML = '<span>🔍</span> Scan View';
@@ -3245,8 +3902,42 @@
         if (card) {
             card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             card.style.borderColor = '#38bdf8';
-            setTimeout(() => { card.style.borderColor = '#ff2d55'; }, 1500);
+            setTimeout(() => { card.style.borderColor = ''; }, 1500);
         }
+    }
+
+    function renderCompactFixer() {
+        const titleEl = document.getElementById('nar-cmp-title');
+        const subEl = document.getElementById('nar-cmp-sub');
+        const prevBtn = document.getElementById('nar-cmp-prev');
+        const nextBtn = document.getElementById('nar-cmp-next');
+        const gotoBtn = document.getElementById('nar-cmp-goto');
+        const drawBtn = document.getElementById('nar-cmp-draw');
+        const doneBtn = document.getElementById('nar-cmp-done');
+        const copyBtn = document.getElementById('nar-cmp-copy');
+        const dismissBtn = document.getElementById('nar-cmp-dismiss');
+
+        if (!titleEl || !subEl) return;
+
+        const total = currentResults.stretches.length;
+        const hasItems = total > 0;
+        [prevBtn, nextBtn, gotoBtn, drawBtn, doneBtn, copyBtn, dismissBtn].forEach(b => {
+            if (b) b.disabled = !hasItems;
+        });
+
+        if (!hasItems) {
+            titleEl.textContent = '🎉 Queue All Clear!';
+            subEl.textContent = 'Click ⤢ to expand & scan an area';
+            return;
+        }
+
+        if (activeStretchIndex >= total) activeStretchIndex = 0;
+        const cur = currentResults.stretches[activeStretchIndex];
+        const cleanNodes = buildMinimalNodeRoadPoints(cur.points, settings.drawSimplifyToleranceMeters || 8);
+        const internalNodes = Math.max(0, cleanNodes.length - 2);
+
+        titleEl.textContent = `🚨 Stretch ${activeStretchIndex + 1} of ${total} (~${cur.approxLengthMeters}m)`;
+        subEl.textContent = `${cur.pointCount} GPS pts • ${internalNodes === 0 ? 'Straight line' : `${internalNodes} bend node(s)`}`;
     }
 
     function renderAlertList() {
@@ -3255,55 +3946,69 @@
         const statGps = document.getElementById('nar-stat-gps');
         const statCovered = document.getElementById('nar-stat-covered');
         const statUnmapped = document.getElementById('nar-stat-unmapped');
+        const qToolbar = document.getElementById('nar-queue-toolbar');
+        const qSummary = document.getElementById('nar-queue-summary');
+
+        const totalQueued = currentResults.stretches.length;
 
         if (statGps) statGps.textContent = currentResults.totalGpsInView;
         if (statCovered) statCovered.textContent = currentResults.coveredGpsCount;
-        if (statUnmapped) statUnmapped.textContent = currentResults.unmappedGpsCount;
+        if (statUnmapped) statUnmapped.textContent = totalQueued;
 
         if (badge) {
-            if (currentResults.stretches.length > 0) {
-                badge.textContent = currentResults.stretches.length;
+            if (totalQueued > 0) {
+                badge.textContent = totalQueued;
                 badge.style.display = 'inline-block';
             } else {
                 badge.style.display = 'none';
             }
         }
 
+        if (qToolbar) {
+            qToolbar.style.display = totalQueued > 0 ? 'flex' : 'none';
+            if (qSummary) qSummary.textContent = `📋 ${totalQueued} Saved in Queue`;
+        }
+
+        renderCompactFixer();
+
         if (!container) return;
         container.innerHTML = '';
 
-        if (currentResults.stretches.length === 0) {
+        if (totalQueued === 0) {
             if (currentResults.totalGpsInView > 0 && crawlerState.status !== 'running') {
                 container.innerHTML = `
                     <div style="text-align:center; color:#94a3b8; padding:12px; font-size:12px;">
-                        🎉 All detected GPS traces have drivable road segments underneath!
+                        🎉 Queue empty — all scanned GPS traces have drivable roads underneath!
                     </div>
                 `;
             }
             return;
         }
 
-        currentResults.stretches.forEach((stretch) => {
+        currentResults.stretches.forEach((stretch, idx) => {
             const card = document.createElement('div');
             card.id = `nar-card-${stretch.id}`;
-            card.className = 'nar-alert-card';
+            card.className = 'nar-alert-card' + (idx === activeStretchIndex ? ' nar-card-active' : '');
             card.innerHTML = `
                 <div class="nar-alert-header">
                     <span class="nar-alert-title">🚨 Stretch #${stretch.id}</span>
-                    <span style="font-size:10px; color:#ff2d55; font-weight:bold;">${stretch.pointCount} GPS pts</span>
+                    <span style="font-size:10px; color:#ff2d55; font-weight:bold;">~${stretch.approxLengthMeters}m • ${stretch.pointCount} pts</span>
                 </div>
                 <div class="nar-alert-meta">
-                    Approx length: <b>~${stretch.approxLengthMeters}m</b> | ${stretch.centerLat.toFixed(5)}, ${stretch.centerLon.toFixed(5)}
+                    ${stretch.centerLat.toFixed(5)}, ${stretch.centerLon.toFixed(5)}${stretch.sourceArea ? ` • <i>${stretch.sourceArea}</i>` : ''}
                 </div>
                 <div class="nar-card-actions">
-                    <button class="nar-action-btn nar-action-btn-draw" id="nar-draw-${stretch.id}" title="Center at Zoom 18 and add draft Street">
-                        🛣️ Draw Road
+                    <button class="nar-action-btn nar-action-btn-draw" id="nar-draw-${stretch.id}" title="Center at Zoom 18 and draw straight minimal-node Street">
+                        🛣️ Draw
                     </button>
-                    <button class="nar-action-btn" id="nar-goto-${stretch.id}" title="Center at Zoom 18">
-                        🎯 Go to
+                    <button class="nar-action-btn" id="nar-goto-${stretch.id}" title="Center on stretch at Zoom 18 (keeps full queue!)">
+                        🎯 Go
                     </button>
-                    <button class="nar-action-btn" id="nar-copy-${stretch.id}" title="Copy Zoom 18 permalink">
-                        🔗 Copy PL
+                    <button class="nar-action-btn nar-action-btn-done" id="nar-done-${stretch.id}" title="Mark fixed & remove from queue">
+                        ✅ Done
+                    </button>
+                    <button class="nar-action-btn" style="flex:0.6;" id="nar-copy-${stretch.id}" title="Copy Zoom 18 permalink">
+                        🔗 PL
                     </button>
                     <button class="nar-action-btn nar-action-btn-dismiss" id="nar-dismiss-${stretch.id}" title="Dismiss as false positive">
                         ✖️
@@ -3318,30 +4023,25 @@
                 drawDraftRoad(stretch.id);
             };
 
-            card.querySelector(`#nar-goto-${stretch.id}`).onclick = () => {
-                if (crawlerState.status === 'running') pauseGridCrawler();
-                goToLocationAndVerifyZoom(stretch.centerLat, stretch.centerLon, 18);
-                showToast(`Centered on Stretch #${stretch.id} at Zoom 18`, 'info');
+            card.querySelector(`#nar-goto-${stretch.id}`).onclick = async () => {
+                await jumpToStretchByIndex(idx);
+                showToast(`Centered on Stretch #${stretch.id} (${totalQueued} kept in queue)`, 'info');
+            };
+
+            card.querySelector(`#nar-done-${stretch.id}`).onclick = () => {
+                resolveStretchById(stretch.id, false);
             };
 
             card.querySelector(`#nar-copy-${stretch.id}`).onclick = (e) => {
                 copyToClipboard(stretch.permalink);
                 const btn = e.currentTarget;
-                btn.textContent = '✅ Copied!';
-                setTimeout(() => { btn.textContent = '🔗 Copy PL'; }, 1500);
+                btn.textContent = '✅';
+                setTimeout(() => { btn.textContent = '🔗 PL'; }, 1400);
                 showToast('Zoom 18 Permalink copied to clipboard!', 'success');
             };
 
             card.querySelector(`#nar-dismiss-${stretch.id}`).onclick = () => {
-                const key = `${stretch.centerLat.toFixed(4)}_${stretch.centerLon.toFixed(4)}`;
-                dismissedStretches.add(key);
-                saveDismissed();
-                const resetBtn = document.getElementById('nar-btn-reset-dismissed');
-                if (resetBtn) resetBtn.textContent = `🔄 Reset Dismissed (${dismissedStretches.size})`;
-                showToast(`Stretch #${stretch.id} dismissed and remembered.`, 'info');
-                currentResults.stretches = currentResults.stretches.filter(s => s.id !== stretch.id);
-                renderAlertList();
-                renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+                resolveStretchById(stretch.id, true);
             };
         });
     }
@@ -3389,8 +4089,11 @@
         if (currentResults.stretches.length > 0) {
             renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
         }
-        if (settings.autoScanOnMove && crawlerState.status !== 'running' && getCurrentZoom() >= 18) {
-            debounceScan(650);
+        if (settings.autoScanOnMove &&
+            crawlerState.status !== 'running' &&
+            Date.now() >= suppressAutoScanUntil &&
+            getCurrentZoom() >= 18) {
+            debounceScan(700);
         }
     }
 
@@ -3447,9 +4150,18 @@
         isInitialized = true;
         console.log(`[${SCRIPT_SHORT}] Initialized v${SCRIPT_VERSION}`);
 
+        // Restore previously compiled queue before injecting UI so editors can pick up across sessions!
+        const restoredCount = loadCompiledQueue();
+
         injectUI();
         ensureRequiredLayers();
         setupMapListeners();
+
+        if (restoredCount > 0) {
+            renderAlertList();
+            renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+            updateStatusText(`📋 Restored ${restoredCount} saved stretch(es) in your queue!`);
+        }
 
         // Refresh Editable Areas as user profile & map models finish hydrating
         setTimeout(() => populateAreaPicker(), 1200);
@@ -3461,8 +4173,8 @@
             const z = getCurrentZoom();
             if (z >= 18) {
                 runScanner();
-            } else {
-                updateStatusText(`Map is at Zoom ${z}. GPS traces require Zoom 18+. Click 'Zoom to 18 & Scan' or 'Start Area Crawl'!`);
+            } else if (restoredCount === 0) {
+                updateStatusText(`Map is at Zoom ${z}. Click 'Zoom 18 & Scan' or run a 4 km² / 20 km² Area Crawl!`);
             }
         }, 1400);
     }
