@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         WME Need a Road, Dude!
-// @namespace    https://github.com/Waze
-// @version      1.4.0
-// @description  Spots unmapped roads in Waze Map Editor (WME) at Zoom 18+, compiles a persistent work queue across sessions, scans 4 km² and 20 km² or Editable Areas, draws clean minimal-node roads, and exports Zoom 18 permalinks.
-// @author       McLaren with assistive AI
+// @namespace    https://github.com/McLarenMCL38/wme-need-a-road-dude
+// @version      1.5.0
+// @description  Spots unmapped roads in Waze Map Editor (WME) at Zoom 18+, compiles a persistent work queue across sessions, scans 4 km² and 20 km² or Editable Areas, auto-snaps minimal-node roads with inherited City/State & One-Way detection, and exports Zoom 18 permalinks.
+// @author       McLaren (Original Idea, Updates & Improvements) & Antigravity AI (Coding, Tech Skills & Improvements)
+// @homepageURL  https://github.com/McLarenMCL38/wme-need-a-road-dude
+// @supportURL   https://github.com/McLarenMCL38/wme-need-a-road-dude/issues
+// @downloadURL  https://github.com/McLarenMCL38/wme-need-a-road-dude/raw/refs/heads/main/wme-need-a-road.user.js
+// @updateURL    https://github.com/McLarenMCL38/wme-need-a-road-dude/raw/refs/heads/main/wme-need-a-road.user.js
 // @match        https://*.waze.com/*editor*
 // @match        https://www.waze.com/editor*
 // @match        https://beta.waze.com/*editor*
@@ -16,32 +20,27 @@
 // ==/UserScript==
 
 /* ============================================================================
-   🎉 UPDATE NOTES — v1.4.0 ("The 'Stop Touching My List & Sober Up the Road' Update")
+   🎉 UPDATE NOTES — v1.5.0 ("The 'Snap Decisions, Spiderweb Buster & Waze-Blue Makeover' Update")
    ============================================================================
-   🧠 Amnesia Cured (Persistent Queue):
-      - Previously, clicking "Go" or "Draw" made the rest of your scanned list
-        pull a Houdini and vanish. Fixed! Your compiled queue now stays put AND
-        saves to your browser so you can go touch grass and finish editing tomorrow.
+   🔌 Look Ma, Real Junctions! (Smart Road Creation):
+      - "Draw" stopped leaving an awkward 18-meter social-distancing gap before
+        existing roads! It now rank-safely extends, splits, and snaps a real junction
+        (or politely stops 4m short if the road outranks you or is a Freeway).
+      - Automatically inherits City & State from the neighbor road, ticks Street Name
+        to "None" so WME stops screaming in red, matches the parent Lock Rank (capped
+        at yours), reads Waze's rainbow GPS arrow colors to spot One-Way traffic,
+        reminds you to double-check Road Type, and auto-checks off the stretch when
+        you hit Save in WME!
 
-   📐 Sober Road Drawing (Minimal Nodes):
-      - GPS traces bounce around like a shopping cart with a broken wheel.
-        "Draw" now uses orthogonal regression + RDP smoothing so straight streets
-        get ZERO extra geometry nodes (just Point A to Point B), and curves only
-        keep the bends that actually matter.
+   🕸️ Evicted Couch-Potato GPS Spiderwebs & Border Hoppers:
+      - Someone leaving Waze open on their living-room sofa no longer convinces us
+        there's a 6-lane cul-de-sac in their kitchen (indoor spiderweb drift rejected!).
+      - 4 km² and 20 km² scans now stay strictly inside your Editable Area by default
+        (toggleable in Settings if you like window-shopping across the border).
 
-   🪶 Shrink Ray & Drag Handle:
-      - Tired of the panel hogging half your monitor like an uninvited passenger?
-        Grab the blue header bar to drag it anywhere! Even better: once a scan
-        wraps up, it automatically folds into a tiny "Compact Fixer Bar" so you
-        can step through stretches (◀ / ▶) with maximum map space.
-
-   🗺️ Goldilocks Scan Sizes (4 km² & 20 km²):
-      - Added "Surrounding Window (4 km²)" for a quick coffee-break sweep and
-        "Wide Surrounding Window (20 km²)" for when you're feeling ambitious,
-        plus CSV export for spreadsheet lovers.
-
-   ✂️ Title Liposuction:
-      - Trimmed the mouthful subtitle off the script name & description.
+   🩵 Dressed in Iconic Waze Blue + Actually Glides + Readable Without Squinting:
+      - Fresh #33CCFF Waze-logo header, rock-solid document-capture dragging, Settings
+        moved right to the top, and bigger Zoom & UI text so your eyes can relax!
    ============================================================================ */
 
 (function () {
@@ -49,7 +48,8 @@
 
     const SCRIPT_NAME = 'Need a Road, Dude!';
     const SCRIPT_SHORT = 'NeedARoad';
-    const SCRIPT_VERSION = '1.4.0';
+    const SCRIPT_VERSION = '1.5.0';
+    const SETTINGS_SCHEMA_VERSION = 3;
 
     // Global reference to page window / unsafeWindow
     const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
@@ -71,17 +71,20 @@
 
     // Default Configuration & Settings State
     const settings = {
-        proximityThresholdMeters: 6,     // Max distance (meters) between GPS point and drivable segment to count as covered
-        minPointsPerStretch: 3,          // Minimum unmapped GPS points to trigger a stretch alert (filters drift)
-        clusterDistanceMeters: 60,       // Points within this distance are grouped into the same stretch
+        settingsSchemaVersion: SETTINGS_SCHEMA_VERSION,
+        proximityThresholdMeters: 18,    // Optimal street half-corridor (18m streets, auto-scales up to 28m on freeways)
+        minPointsPerStretch: 4,          // Minimum unmapped GPS samples to trigger a stretch alert
+        clusterDistanceMeters: 55,       // Grouping distance for neighboring unmapped GPS samples
         drawSimplifyToleranceMeters: 8,  // Straightness / RDP tolerance (meters) for minimal-node road drawing
         crawlerStepDelayMs: 1800,        // Delay per tile during crawl to allow WME to download & render Zoom 18+ GPS tiles
         crawlerZoomLevel: 18,            // Crawler zoom level (strictly >= 18 so GPS traces load)
+        onlyInsideEditableArea: true,    // Skip stretches & crawl tiles outside editor's WME Editable Area by default
         autoScanOnMove: true,            // Automatically scan & append new stretches when map stops moving at Zoom 18+
         autoCompactAfterScan: true,      // Shrink into compact draggable fixer bar once a scan/crawl finishes with results
+        showRawGpsDots: false,           // Keep map clean with smooth centerline highlights (no red dot clutter!)
         soundAlerts: false,              // Play a subtle chime when missing roads are found
-        highlightColor: '#ff2d55',       // Glowing color for missing road GPS points
-        highlightGlow: '#ff9500',        // Secondary halo glow
+        highlightColor: '#ff2d55',       // Outer corridor glow color
+        highlightGlow: '#ff9f1c',        // Inner smoothed centerline color
         panelCollapsed: false,
         uiMode: 'full',                  // 'full' | 'compact'
         panelLeft: null,                 // Persisted draggable X coordinate (px)
@@ -89,12 +92,31 @@
         zoomMinRequired: 18              // WME requires Zoom 18+ to load and display GPS traces
     };
 
-    // Load persisted settings with strict Zoom 18+ floor migration
+    // Load persisted settings & auto-migrate old schemas
     try {
         const saved = localStorage.getItem('WME_NeedARoad_Settings');
         if (saved) {
             const parsed = JSON.parse(saved);
+            const oldSchema = parsed.settingsSchemaVersion || 1;
             Object.assign(settings, parsed);
+
+            if (oldSchema < 2) {
+                if (!parsed.proximityThresholdMeters || parsed.proximityThresholdMeters < 15) {
+                    settings.proximityThresholdMeters = 18;
+                }
+                if (!parsed.minPointsPerStretch || parsed.minPointsPerStretch < 4) {
+                    settings.minPointsPerStretch = 4;
+                }
+                settings.showRawGpsDots = false;
+                localStorage.removeItem('WME_NeedARoad_CompiledQueue');
+            }
+            if (oldSchema < SETTINGS_SCHEMA_VERSION) {
+                if (typeof parsed.onlyInsideEditableArea !== 'boolean') {
+                    settings.onlyInsideEditableArea = true;
+                }
+                settings.settingsSchemaVersion = SETTINGS_SCHEMA_VERSION;
+                localStorage.setItem('WME_NeedARoad_Settings', JSON.stringify(settings));
+            }
         }
     } catch (e) {
         console.warn(`[${SCRIPT_SHORT}] Could not load settings:`, e);
@@ -104,6 +126,9 @@
     }
     if (!Number.isFinite(settings.crawlerZoomLevel) || settings.crawlerZoomLevel < 18) {
         settings.crawlerZoomLevel = 18;
+    }
+    if (!Number.isFinite(settings.proximityThresholdMeters) || settings.proximityThresholdMeters < 6) {
+        settings.proximityThresholdMeters = 18;
     }
     if (!Number.isFinite(settings.drawSimplifyToleranceMeters) || settings.drawSimplifyToleranceMeters < 2) {
         settings.drawSimplifyToleranceMeters = 8;
@@ -142,10 +167,12 @@
     let networkHookInstalled = false;
     let suppressAutoScanUntil = 0;       // Prevents Go To / Draw jumps from triggering unnecessary re-scans
     let activeStretchIndex = 0;          // Currently focused stretch in Compact Fixer & Queue list
+    let lastDrawnStretchId = null;       // Tracks active stretch awaiting WME Save to auto-complete
+    let lastDrawReminderMsg = '';        // Post-Draw verification checklist message
 
     // GPS Data & Raster Tile Cache
     const capturedGpsPoints = new Map(); // key -> { lon, lat, x, y, timestamp }
-    const rasterTileCache = new Map();   // tileUrl -> Array<{ u: number, v: number }> | 'non_gps' | 'failed'
+    const rasterTileCache = new Map();   // tileUrl -> Array<{ u: number, v: number, hue: number|null }> | 'non_gps' | 'failed'
     const cachedNetworkAreas = [];       // Editable / Managed area objects captured from WME responses
     let cachedResolvedAreas = [];        // Latest list used in the Area Picker dropdown
 
@@ -167,7 +194,9 @@
                 approxLengthMeters: s.approxLengthMeters,
                 permalink: s.permalink,
                 sourceArea: s.sourceArea || '',
-                pts: (s.points || []).slice(0, 60).map(p => [Number(p.lon.toFixed(6)), Number(p.lat.toFixed(6))])
+                pts: (s.points || []).slice(0, 60).map(p => (typeof p.hue === 'number')
+                    ? [Number(p.lon.toFixed(6)), Number(p.lat.toFixed(6)), Math.round(p.hue)]
+                    : [Number(p.lon.toFixed(6)), Number(p.lat.toFixed(6))])
             }));
             localStorage.setItem('WME_NeedARoad_CompiledQueue', JSON.stringify({
                 savedAt: Date.now(),
@@ -191,14 +220,18 @@
                 if (!Number.isFinite(item.centerLat) || !Number.isFinite(item.centerLon)) continue;
                 if (isStretchDismissed(item.centerLat, item.centerLon)) continue;
                 const pts = Array.isArray(item.pts)
-                    ? item.pts.map(pair => ({ lon: pair[0], lat: pair[1] })).filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat))
-                    : [{ lon: item.centerLon, lat: item.centerLat }];
+                    ? item.pts.map(pair => ({
+                        lon: pair[0],
+                        lat: pair[1],
+                        hue: (typeof pair[2] === 'number') ? pair[2] : null
+                    })).filter(p => Number.isFinite(p.lon) && Number.isFinite(p.lat))
+                    : [{ lon: item.centerLon, lat: item.centerLat, hue: null }];
                 restored.push({
                     id: restored.length + 1,
                     centerLat: item.centerLat,
                     centerLon: item.centerLon,
                     pointCount: item.pointCount || pts.length,
-                    approxLengthMeters: item.approxLengthMeters || 20,
+                    approxLengthMeters: item.approxLengthMeters || 25,
                     points: pts,
                     permalink: item.permalink || generatePermalink(item.centerLat, item.centerLon, 18),
                     sourceArea: item.sourceArea || ''
@@ -702,6 +735,20 @@
         return { canvas: sharedSampleCanvas, ctx: sharedSampleCtx };
     }
 
+    function rgbToHueDeg(r, g, b) {
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const delta = max - min;
+        if (delta < 32) return null; // Not saturated enough to carry reliable Waze azimuth hue
+        let h = 0;
+        if (max === r) h = ((g - b) / delta) % 6;
+        else if (max === g) h = (b - r) / delta + 2;
+        else h = (r - g) / delta + 4;
+        h = h * 60;
+        if (h < 0) h += 360;
+        return h;
+    }
+
     function analyzeImageDataForGpsTraces(imageData, w, h, cellPx = 8) {
         const data = imageData.data;
         const totalPixels = w * h;
@@ -728,6 +775,7 @@
             for (let cx = 0; cx < w; cx += step) {
                 const xMax = Math.min(w, cx + step);
                 let sumX = 0, sumY = 0, hitCount = 0;
+                let hueSinSum = 0, hueCosSum = 0, hueCount = 0;
 
                 for (let py = cy; py < yMax; py += 2) {
                     const rowOffset = py * w * 4;
@@ -748,14 +796,27 @@
                             sumX += px;
                             sumY += py;
                             hitCount++;
+                            const hue = rgbToHueDeg(r, g, b);
+                            if (hue !== null) {
+                                const rad = hue * Math.PI / 180;
+                                hueCosSum += Math.cos(rad);
+                                hueSinSum += Math.sin(rad);
+                                hueCount++;
+                            }
                         }
                     }
                 }
 
                 if (hitCount > 0) {
+                    let cellHue = null;
+                    if (hueCount > 0) {
+                        cellHue = Math.atan2(hueSinSum / hueCount, hueCosSum / hueCount) * 180 / Math.PI;
+                        if (cellHue < 0) cellHue += 360;
+                    }
                     uvPoints.push({
                         u: (sumX / hitCount) / w,
-                        v: (sumY / hitCount) / h
+                        v: (sumY / hitCount) / h,
+                        hue: cellHue
                     });
                 }
             }
@@ -984,7 +1045,7 @@
             }));
 
             for (const { rect, uvList } of tileResults) {
-                for (const { u, v } of uvList) {
+                for (const { u, v, hue } of uvList) {
                     const vx = (rect.left - mapRect.left) + u * rect.width;
                     const vy = (rect.top - mapRect.top) + v * rect.height;
                     if (vx < 0 || vy < 0 || vx > mapRect.width || vy > mapRect.height) continue;
@@ -992,7 +1053,7 @@
                     const ll = pixelToLonLat(vx, vy, extent, mapRect.width, mapRect.height);
                     if (ll && Number.isFinite(ll.lon) && Number.isFinite(ll.lat)) {
                         const merc = latLonToMercator(ll.lat, ll.lon);
-                        extracted.push({ lon: ll.lon, lat: ll.lat, x: merc.x, y: merc.y });
+                        extracted.push({ lon: ll.lon, lat: ll.lat, x: merc.x, y: merc.y, hue: hue ?? null });
                     }
                 }
             }
@@ -1010,7 +1071,7 @@
                 const cvCellPx = Math.max(4, Math.round(targetSamplePx * (cv.width / r.width)));
                 const uvList = analyzeImageDataForGpsTraces(imgData, cv.width, cv.height, cvCellPx);
                 if (Array.isArray(uvList)) {
-                    for (const { u, v } of uvList) {
+                    for (const { u, v, hue } of uvList) {
                         const vx = (r.left - mapRect.left) + u * r.width;
                         const vy = (r.top - mapRect.top) + v * r.height;
                         if (vx < 0 || vy < 0 || vx > mapRect.width || vy > mapRect.height) continue;
@@ -1018,7 +1079,7 @@
                         const ll = pixelToLonLat(vx, vy, extent, mapRect.width, mapRect.height);
                         if (ll && Number.isFinite(ll.lon) && Number.isFinite(ll.lat)) {
                             const merc = latLonToMercator(ll.lat, ll.lon);
-                            extracted.push({ lon: ll.lon, lat: ll.lat, x: merc.x, y: merc.y });
+                            extracted.push({ lon: ll.lon, lat: ll.lat, x: merc.x, y: merc.y, hue: hue ?? null });
                         }
                     }
                 }
@@ -1278,10 +1339,21 @@
             }
 
             if (wgsCoords.length >= 2) {
+                const attrs = seg.attributes || {};
+                const lockRank = seg.lockRank ?? attrs.lockRank ?? 0;
+                const primaryStreetId = seg.primaryStreetId ?? attrs.primaryStreetID ?? attrs.primaryStreetId ?? null;
+                const fromNodeId = seg.fromNodeId ?? attrs.fromNodeID ?? attrs.fromNodeId ?? null;
+                const toNodeId = seg.toNodeId ?? attrs.toNodeID ?? attrs.toNodeId ?? null;
+
                 parsedSegments.push({
-                    id: seg.id ?? (seg.attributes && seg.attributes.id),
+                    id: seg.id ?? attrs.id,
                     roadType: rType,
-                    wgsPoints: wgsCoords
+                    lockRank: typeof lockRank === 'number' ? lockRank : 0,
+                    primaryStreetId,
+                    fromNodeId,
+                    toNodeId,
+                    wgsPoints: wgsCoords,
+                    rawSeg: seg
                 });
             }
         }
@@ -1292,9 +1364,9 @@
     // Extract all GPS points currently in viewport (Vector + Model + Network + Raster GPS Layer)
     async function getGpsPointsInViewport(extent) {
         const pointsInView = [];
-        const seenGrid = new Set(); // Deduplicate within ~2.5m cells
+        const seenGrid = new Map(); // gridKey -> index in pointsInView
 
-        function addCandidate(lon, lat) {
+        function addCandidate(lon, lat, hue = null) {
             if (!Number.isFinite(lon) || !Number.isFinite(lat)) return;
             if (extent) {
                 if (lon < extent.minLon || lon > extent.maxLon || lat < extent.minLat || lat > extent.maxLat) {
@@ -1303,9 +1375,12 @@
             }
             const gridKey = `${Math.round(lat * 45000)}_${Math.round(lon * 45000)}`;
             if (!seenGrid.has(gridKey)) {
-                seenGrid.add(gridKey);
+                seenGrid.set(gridKey, pointsInView.length);
                 const merc = latLonToMercator(lat, lon);
-                pointsInView.push({ lon, lat, x: merc.x, y: merc.y });
+                pointsInView.push({ lon, lat, x: merc.x, y: merc.y, hue: typeof hue === 'number' ? hue : null });
+            } else if (typeof hue === 'number') {
+                const existingPt = pointsInView[seenGrid.get(gridKey)];
+                if (existingPt && existingPt.hue === null) existingPt.hue = hue;
             }
         }
 
@@ -1335,13 +1410,13 @@
 
         // 3. Previously captured vector / network GPS points in view
         for (const pt of capturedGpsPoints.values()) {
-            addCandidate(pt.lon, pt.lat);
+            addCandidate(pt.lon, pt.lat, null);
         }
 
-        // 4. Raster GPS Tile / Canvas Pixel Scanner (reads WME's gps_points tile layer directly!)
+        // 4. Raster GPS Tile / Canvas Pixel Scanner (reads WME's gps_points tile layer + azimuth hues directly!)
         const rasterPts = await extractRasterGpsPointsInView(extent);
         for (const rp of rasterPts) {
-            addCandidate(rp.lon, rp.lat);
+            addCandidate(rp.lon, rp.lat, rp.hue);
         }
 
         return pointsInView;
@@ -1780,6 +1855,71 @@
     /* ==========================================================================
        6. CORE SCANNING & COMPILED QUEUE MERGING (Zoom 18+)
        ========================================================================== */
+    // Road-type-aware corridor radius: accounts for multi-lane carriageways + consumer phone GPS scatter
+    function getRoadCoverageRadiusMeters(roadType, baseTolerance = 18) {
+        const base = Math.max(8, baseTolerance);
+        const scale = base / 18;
+        switch (roadType) {
+            case 3:  return Math.max(base, Math.round(28 * scale)); // Freeway (wide lanes + shoulders + high-speed GPS lag)
+            case 6:  return Math.max(base, Math.round(24 * scale)); // Major Highway
+            case 7:                                                 // Minor Highway
+            case 2:                                                 // Primary Street
+            case 4:  return Math.max(base, Math.round(21 * scale)); // Ramp
+            case 8:                                                 // Dirt / 4WD
+            case 17:                                                // Private Road
+            case 20: return Math.max(14, Math.round(16 * scale));   // Parking Lot Road
+            default: return base;                                   // Standard Street (default 18m)
+        }
+    }
+
+    function computeMinDistanceToSegments(lat, lon, segments) {
+        const R = 6371000;
+        const cosLat = Math.cos(lat * Math.PI / 180);
+        const px = lon * (Math.PI / 180) * R * cosLat;
+        const py = lat * (Math.PI / 180) * R;
+
+        let nearestDist = Infinity;
+        let nearestAngleRad = null;
+        let isCovered = false;
+
+        for (const seg of segments) {
+            const segRadius = getRoadCoverageRadiusMeters(seg.roadType, settings.proximityThresholdMeters);
+            const pts = seg.wgsPoints;
+            for (let i = 0; i < pts.length - 1; i++) {
+                const v1 = pts[i];
+                const v2 = pts[i + 1];
+
+                // Fast ~120m degree bounding-box skip
+                if ((lon < v1.lon - 0.0015 && lon < v2.lon - 0.0015) ||
+                    (lon > v1.lon + 0.0015 && lon > v2.lon + 0.0015) ||
+                    (lat < v1.lat - 0.0012 && lat < v2.lat - 0.0012) ||
+                    (lat > v1.lat + 0.0012 && lat > v2.lat + 0.0012)) {
+                    continue;
+                }
+
+                const ax = v1.lon * (Math.PI / 180) * R * cosLat;
+                const ay = v1.lat * (Math.PI / 180) * R;
+                const bx = v2.lon * (Math.PI / 180) * R * cosLat;
+                const by = v2.lat * (Math.PI / 180) * R;
+
+                const dist = distanceToLineSegmentMeters(px, py, ax, ay, bx, by);
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    let ang = Math.atan2(by - ay, bx - ax);
+                    if (ang < 0) ang += Math.PI;
+                    nearestAngleRad = ang;
+                }
+                if (dist <= segRadius) {
+                    isCovered = true;
+                    break;
+                }
+            }
+            if (isCovered) break;
+        }
+
+        return { isCovered, nearestDist, nearestAngleRad };
+    }
+
     async function runScanner(options = {}) {
         if (isScanning) return;
         isScanning = true;
@@ -1792,7 +1932,7 @@
             const zoom = getCurrentZoom();
             const minZoom = Math.max(18, settings.zoomMinRequired || 18);
             if (zoom < minZoom) {
-                updateStatusText(`⚠️ Map is at Zoom ${zoom}. GPS traces require Zoom ${minZoom}+. Click 'Zoom to 18 & Scan'!`);
+                updateStatusText(`⚠️ Map is at Zoom ${zoom}. GPS traces require Zoom ${minZoom}+. Click 'Zoom 18 & Scan'!`);
                 if (!options.isCrawlerStep) {
                     showToast(`Zoom is ${zoom}. GPS traces only load at Zoom 18+.`, 'warning');
                 }
@@ -1808,12 +1948,34 @@
             const gpsPoints = await getGpsPointsInViewport(extent);
             const segments = getLoadedSegments();
 
+            // Auto-prune any queued stretch in the current view that is now covered by loaded/newly-drawn roads!
+            if (segments.length > 0 && currentResults.stretches.length > 0) {
+                const beforeLen = currentResults.stretches.length;
+                currentResults.stretches = currentResults.stretches.filter(st => {
+                    if (st.centerLon < extent.minLon || st.centerLon > extent.maxLon ||
+                        st.centerLat < extent.minLat || st.centerLat > extent.maxLat) {
+                        return true;
+                    }
+                    const pts = st.points || [];
+                    if (pts.length === 0) return false;
+                    let coveredPts = 0;
+                    for (const p of pts) {
+                        if (computeMinDistanceToSegments(p.lat, p.lon, segments).isCovered) coveredPts++;
+                    }
+                    return (coveredPts / pts.length) < 0.65;
+                });
+                if (currentResults.stretches.length !== beforeLen) {
+                    reindexStretches();
+                    saveCompiledQueue();
+                }
+            }
+
             if (gpsPoints.length === 0) {
                 if (!options.isCrawlerStep) {
                     const qLen = currentResults.stretches.length;
                     if (qLen > 0) {
                         updateStatusText(`No extra GPS traces in this view. (${qLen} stretch(es) kept in your compiled queue).`);
-                        renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+                        renderHighlights(currentResults.stretches);
                     } else {
                         updateStatusText(`No GPS traces visible at Zoom ${zoom} here. (None recorded or still loading).`);
                         clearHighlights();
@@ -1823,47 +1985,32 @@
                 return;
             }
 
-            // Cross-check: GPS + Drivable Segment (<= threshold) => Covered; GPS + No Segment => Flag
+            // Cross-check GPS points against road-type-aware drivable corridors
             const unmappedPoints = [];
             let coveredCount = 0;
-            const threshold = settings.proximityThresholdMeters;
-            const R = 6371000;
 
             for (const pt of gpsPoints) {
-                let hasSegmentUnderneath = false;
-                const cosLat = Math.cos(pt.lat * Math.PI / 180);
-                const px = pt.lon * (Math.PI / 180) * R * cosLat;
-                const py = pt.lat * (Math.PI / 180) * R;
-
-                for (const seg of segments) {
-                    const pts = seg.wgsPoints;
-                    for (let i = 0; i < pts.length - 1; i++) {
-                        const v1 = pts[i];
-                        const v2 = pts[i + 1];
-
-                        const ax = v1.lon * (Math.PI / 180) * R * cosLat;
-                        const ay = v1.lat * (Math.PI / 180) * R;
-                        const bx = v2.lon * (Math.PI / 180) * R * cosLat;
-                        const by = v2.lat * (Math.PI / 180) * R;
-
-                        const dist = distanceToLineSegmentMeters(px, py, ax, ay, bx, by);
-                        if (dist <= threshold) {
-                            hasSegmentUnderneath = true;
-                            break;
-                        }
-                    }
-                    if (hasSegmentUnderneath) break;
-                }
-
-                if (hasSegmentUnderneath) {
+                const check = computeMinDistanceToSegments(pt.lat, pt.lon, segments);
+                if (check.isCovered) {
                     coveredCount++;
                 } else {
-                    unmappedPoints.push(pt);
+                    unmappedPoints.push({
+                        ...pt,
+                        nearestRoadDist: check.nearestDist,
+                        nearestAngleRad: check.nearestAngleRad
+                    });
                 }
             }
 
             const newStretches = clusterUnmappedPoints(unmappedPoints);
-            const activeStretches = newStretches.filter(s => !isStretchDismissed(s.centerLat, s.centerLon));
+            const permAreas = settings.onlyInsideEditableArea ? getUserPermittedAreasOnly() : [];
+            const activeStretches = newStretches.filter(s => {
+                if (isStretchDismissed(s.centerLat, s.centerLon)) return false;
+                if (permAreas.length > 0 && !isPointInsideAnyArea({ lon: s.centerLon, lat: s.centerLat }, permAreas)) {
+                    return false;
+                }
+                return true;
+            });
 
             if (options.isCrawlerStep) {
                 currentResults.totalGpsInView += gpsPoints.length;
@@ -1886,11 +2033,11 @@
                 } else if (currentResults.stretches.length > 0) {
                     updateStatusText(`✅ View clear (${gpsPoints.length} pts on road) | 📋 ${currentResults.stretches.length} stretch(es) in compiled queue.`);
                 } else {
-                    updateStatusText(`✅ All ${gpsPoints.length} GPS trace samples in view have drivable roads underneath.`);
+                    updateStatusText(`✅ All ${gpsPoints.length} GPS trace samples in view are covered by existing roads.`);
                 }
             }
 
-            renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+            renderHighlights(currentResults.stretches);
             renderAlertList();
         } catch (err) {
             console.error(`[${SCRIPT_SHORT}] Error during scan:`, err);
@@ -1939,12 +2086,22 @@
         }, delayMs);
     }
 
+    function computePolylineLengthMeters(wgsPts) {
+        if (!wgsPts || wgsPts.length < 2) return 0;
+        let total = 0;
+        for (let i = 0; i < wgsPts.length - 1; i++) {
+            total += haversineDistanceMeters(wgsPts[i].lat, wgsPts[i].lon, wgsPts[i + 1].lat, wgsPts[i + 1].lon);
+        }
+        return total;
+    }
+
     function clusterUnmappedPoints(points) {
         if (points.length === 0) return [];
 
         const clusters = [];
         const visited = new Set();
         const clusterDist = settings.clusterDistanceMeters;
+        const baseTol = Math.max(8, settings.proximityThresholdMeters || 18);
 
         for (let i = 0; i < points.length; i++) {
             if (visited.has(i)) continue;
@@ -1965,36 +2122,148 @@
                 }
             }
 
-            if (cluster.length >= settings.minPointsPerStretch) {
-                let sumLat = 0, sumLon = 0;
-                let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+            if (cluster.length < settings.minPointsPerStretch) continue;
 
-                for (const p of cluster) {
-                    sumLat += p.lat;
-                    sumLon += p.lon;
-                    if (p.lat < minLat) minLat = p.lat;
-                    if (p.lat > maxLat) maxLat = p.lat;
-                    if (p.lon < minLon) minLon = p.lon;
-                    if (p.lon > maxLon) maxLon = p.lon;
-                }
+            // Smart False-Positive Rejection:
+            // 1) Excursion check: reject clusters that merely hug the outer GPS scatter edge of an existing road
+            let maxRoadDist = 0;
+            let deepPointsCount = 0;
+            const minExcursionPeak = Math.max(25, baseTol + 7);
+            const deepThreshold = baseTol + 5;
 
-                const centerLat = sumLat / cluster.length;
-                const centerLon = sumLon / cluster.length;
-                const approxLengthMeters = Math.round(haversineDistanceMeters(minLat, minLon, maxLat, maxLon));
-
-                clusters.push({
-                    id: clusters.length + 1,
-                    centerLat,
-                    centerLon,
-                    pointCount: cluster.length,
-                    approxLengthMeters: Math.max(12, approxLengthMeters),
-                    points: cluster,
-                    permalink: generatePermalink(centerLat, centerLon, Math.max(18, settings.crawlerZoomLevel || 18))
-                });
+            for (const p of cluster) {
+                const d = (typeof p.nearestRoadDist === 'number') ? p.nearestRoadDist : 999;
+                if (d > maxRoadDist) maxRoadDist = d;
+                if (d >= deepThreshold) deepPointsCount++;
             }
+            if (maxRoadDist < minExcursionPeak || deepPointsCount < 2) {
+                continue;
+            }
+
+            // 2) Smoothed road span check: reject corner-overshoot blobs & parked-car drift shorter than 25m
+            const cleanLine = buildMinimalNodeRoadPoints(cluster, settings.drawSimplifyToleranceMeters || 8);
+            const roadLengthMeters = Math.round(computePolylineLengthMeters(cleanLine));
+            if (roadLengthMeters < 25) {
+                continue;
+            }
+
+            // 3) Parallel multipath / wide-boulevard shadow filter:
+            // Reject short (<80m) strips running parallel (<22 deg) within 36m alongside an existing mapped road
+            if (maxRoadDist < 36 && roadLengthMeters < 80 && cleanLine.length >= 2) {
+                const a = cleanLine[0], b = cleanLine[cleanLine.length - 1];
+                const cosLat = Math.cos(a.lat * Math.PI / 180);
+                let stretchAng = Math.atan2(b.lat - a.lat, (b.lon - a.lon) * cosLat);
+                if (stretchAng < 0) stretchAng += Math.PI;
+
+                const validRoadAngles = cluster.map(p => p.nearestAngleRad).filter(v => typeof v === 'number');
+                if (validRoadAngles.length > 0) {
+                    let parallelMatches = 0;
+                    for (const ra of validRoadAngles) {
+                        let diff = Math.abs(stretchAng - ra);
+                        if (diff > Math.PI / 2) diff = Math.PI - diff;
+                        if (diff <= (22 * Math.PI / 180)) parallelMatches++;
+                    }
+                    if ((parallelMatches / validRoadAngles.length) >= 0.7) {
+                        continue;
+                    }
+                }
+            }
+
+            // 4) Indoor "Spiderweb" GPS Drift Rejection:
+            // Stationary indoor GPS drift forms a boxy/round cloud (low aspect ratio) with chaotic rainbow hues
+            // pointing randomly in every direction, whereas real One-Way or Two-Way roads are linear or axially aligned!
+            if (roadLengthMeters < 60 && cleanLine.length >= 2) {
+                const R = 6371000;
+                const lat0 = cluster.reduce((s, p) => s + p.lat, 0) / cluster.length;
+                const lon0 = cluster.reduce((s, p) => s + p.lon, 0) / cluster.length;
+                const cosLat = Math.max(0.1, Math.cos(lat0 * Math.PI / 180));
+                const mLon = (Math.PI / 180) * R * cosLat;
+                const mLat = (Math.PI / 180) * R;
+
+                let cxx = 0, cxy = 0, cyy = 0;
+                for (const p of cluster) {
+                    const dx = (p.lon - lon0) * mLon;
+                    const dy = (p.lat - lat0) * mLat;
+                    cxx += dx * dx;
+                    cxy += dx * dy;
+                    cyy += dy * dy;
+                }
+                const trace = cxx + cyy;
+                const det = cxx * cyy - cxy * cxy;
+                const disc = Math.sqrt(Math.max(0, (trace * trace) / 4 - det));
+                const lambda1 = Math.max(1, trace / 2 + disc);
+                const lambda2 = Math.max(0.5, trace / 2 - disc);
+                const aspectRatio = Math.sqrt(lambda1 / lambda2);
+
+                const hues = cluster.map(p => p.hue).filter(h => typeof h === 'number');
+                if (aspectRatio < 1.8 && hues.length >= 6) {
+                    // Doubled-angle axial resultant R_axial: 1.0 for pure 1-way OR pure 2-way, ~0 for random spiderweb!
+                    let sumCos2 = 0, sumSin2 = 0;
+                    for (const h of hues) {
+                        const rad2 = (2 * h) * Math.PI / 180;
+                        sumCos2 += Math.cos(rad2);
+                        sumSin2 += Math.sin(rad2);
+                    }
+                    const axialCoherence = Math.hypot(sumCos2, sumSin2) / hues.length;
+                    if (axialCoherence < 0.30) {
+                        continue; // Chaotic indoor spiderweb GPS drift blob — skip!
+                    }
+                }
+            }
+
+            let sumLat = 0, sumLon = 0;
+            for (const p of cluster) {
+                sumLat += p.lat;
+                sumLon += p.lon;
+            }
+
+            const centerLat = sumLat / cluster.length;
+            const centerLon = sumLon / cluster.length;
+
+            clusters.push({
+                id: clusters.length + 1,
+                centerLat,
+                centerLon,
+                pointCount: cluster.length,
+                approxLengthMeters: roadLengthMeters,
+                points: cluster,
+                permalink: generatePermalink(centerLat, centerLon, Math.max(18, settings.crawlerZoomLevel || 18))
+            });
         }
 
         return clusters;
+    }
+
+    function getUserPermittedAreasOnly() {
+        const builtInIds = new Set(['current_viewport', 'scan_area_4km2', 'scan_area_20km2']);
+        const all = cachedResolvedAreas.length > 0 ? cachedResolvedAreas : getEditorPermissions();
+        return (all || []).filter(a => a && !builtInIds.has(a.id));
+    }
+
+    function isPointInsideAnyArea(pt, areaList) {
+        if (!areaList || areaList.length === 0) return true;
+        for (const area of areaList) {
+            if (!area.bbox) continue;
+            if (pt.lon < area.bbox.minLon || pt.lon > area.bbox.maxLon ||
+                pt.lat < area.bbox.minLat || pt.lat > area.bbox.maxLat) {
+                continue;
+            }
+            const polys = area.polygons || [];
+            for (const poly of polys) {
+                if (isPointInSinglePolygon(pt, poly)) return true;
+            }
+        }
+        return false;
+    }
+
+    function doesTileTouchPermittedAreas(lon, lat, halfLon, halfLat, permAreas) {
+        if (!permAreas || permAreas.length === 0) return true;
+        for (const area of permAreas) {
+            for (const poly of (area.polygons || [])) {
+                if (doesTileIntersectPolygon(lon, lat, halfLon, halfLat, poly)) return true;
+            }
+        }
+        return false;
     }
 
     /* ==========================================================================
@@ -2053,6 +2322,12 @@
         const halfLat = stepLat / 2;
         const MAX_TILES = 8000;
 
+        // When scanning 4 km² / 20 km² / Viewport and Editable Area filter is ON, skip tiles outside permitted areas!
+        const builtInIds = new Set(['current_viewport', 'scan_area_4km2', 'scan_area_20km2']);
+        const permAreas = (settings.onlyInsideEditableArea && builtInIds.has(targetArea.id))
+            ? getUserPermittedAreasOnly()
+            : [];
+
         const polygons = (targetArea.polygons && targetArea.polygons.length > 0)
             ? targetArea.polygons
             : (targetArea.rings || []).map(r => ({ outer: r, holes: [], bbox: targetArea.bbox }));
@@ -2065,6 +2340,9 @@
             for (let lat = pb.minLat + halfLat; lat <= pb.maxLat + halfLat * 0.5; lat += stepLat) {
                 for (let lon = pb.minLon + halfLon; lon <= pb.maxLon + halfLon * 0.5; lon += stepLon) {
                     if (doesTileIntersectPolygon(lon, lat, halfLon, halfLat, poly)) {
+                        if (permAreas.length > 0 && !doesTileTouchPermittedAreas(lon, lat, halfLon, halfLat, permAreas)) {
+                            continue;
+                        }
                         const key = `${Math.round(lat / stepLat)}_${Math.round(lon / stepLon)}`;
                         if (!seenTiles.has(key)) {
                             seenTiles.add(key);
@@ -2081,7 +2359,9 @@
             if (addedForThisPoly === 0 && poly.outer && poly.outer.length > 0 && tiles.length < MAX_TILES) {
                 const cLon = poly.outer.reduce((s, p) => s + p.lon, 0) / poly.outer.length;
                 const cLat = poly.outer.reduce((s, p) => s + p.lat, 0) / poly.outer.length;
-                tiles.push({ lon: cLon, lat: cLat });
+                if (permAreas.length === 0 || isPointInsideAnyArea({ lon: cLon, lat: cLat }, permAreas)) {
+                    tiles.push({ lon: cLon, lat: cLat });
+                }
             }
         }
 
@@ -2306,9 +2586,448 @@
     }
 
     /* ==========================================================================
-       8. MINIMAL-NODE CENTERLINE SMOOTHING & "DRAW ROAD" ACTION
-          (PCA Orthogonal Regression + Cross-Track Averaging + RDP Simplification)
+       8. SMART ROAD CREATION ENGINE
+          (Rank-Safe Junction Snap + Auto City/State & 'None' Street + Lock Match +
+           GPS Color-Azimuth One-Way Detection + Auto-Select + Road Type Reminder)
        ========================================================================== */
+    function getEditorLockRank() {
+        try {
+            if (wmeSDK && (wmeSDK.State || wmeSDK.Users)) {
+                const mod = wmeSDK.State || wmeSDK.Users;
+                const info = typeof mod.getUserInfo === 'function' ? mod.getUserInfo() : mod.userInfo;
+                if (info && typeof info.rank === 'number') return info.rank; // 0-based (0 = L1, 4 = L5)
+            }
+        } catch (e) {}
+        try {
+            const u = win.W && win.W.loginManager && win.W.loginManager.user;
+            const r = u && (u.rank ?? (u.attributes && u.attributes.rank));
+            if (typeof r === 'number') return r;
+        } catch (e) {}
+        return 0;
+    }
+
+    function isInsideParkingLotOrGasVenue(lon, lat) {
+        try {
+            let rawVenues = [];
+            if (wmeSDK && wmeSDK.DataModel && wmeSDK.DataModel.Venues && typeof wmeSDK.DataModel.Venues.getAll === 'function') {
+                const v = wmeSDK.DataModel.Venues.getAll();
+                if (Array.isArray(v)) rawVenues = v;
+            }
+            if (rawVenues.length === 0 && win.W && win.W.model && win.W.model.venues) {
+                if (typeof win.W.model.venues.getObjectArray === 'function') rawVenues = win.W.model.venues.getObjectArray();
+                else if (win.W.model.venues.objects) rawVenues = Object.values(win.W.model.venues.objects);
+            }
+            for (const venue of rawVenues) {
+                if (!venue) continue;
+                const cats = venue.categories || (venue.attributes && venue.attributes.categories) || [];
+                const catStr = Array.isArray(cats) ? cats.join(',') : String(cats);
+                if (!/(PARKING_LOT|GAS_STATION)/i.test(catStr)) continue;
+                const polys = extractPolygonsFromAnyGeometry(venue.geometry || (venue.attributes && venue.attributes.geometry));
+                for (const poly of polys) {
+                    if (isPointInSinglePolygon({ lon, lat }, poly)) {
+                        return /PARKING_LOT/i.test(catStr) ? 'Parking Lot' : 'Gas Station';
+                    }
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    // Detects high-confidence One-Way flow from Waze's azimuth-colored GPS arrows; safely defaults to TWO_WAY
+    function detectRoadDirectionFromGpsHues(points, startPt, endPt) {
+        const hues = (points || []).map(p => p.hue).filter(h => typeof h === 'number');
+        if (hues.length < 8) return { direction: 'TWO_WAY', label: 'Two-Way' };
+
+        let cosSum = 0, sinSum = 0;
+        for (const h of hues) {
+            const rad = h * Math.PI / 180;
+            cosSum += Math.cos(rad);
+            sinSum += Math.sin(rad);
+        }
+        const meanR = Math.hypot(cosSum, sinSum) / hues.length;
+        if (meanR < 0.78) return { direction: 'TWO_WAY', label: 'Two-Way' };
+
+        let domHue = Math.atan2(sinSum / hues.length, cosSum / hues.length) * 180 / Math.PI;
+        if (domHue < 0) domHue += 360;
+
+        // Verify opposing 180° flow is genuinely absent (< 10% opposing samples)
+        let alignedCount = 0;
+        let opposingCount = 0;
+        for (const h of hues) {
+            let diff = Math.abs(h - domHue);
+            if (diff > 180) diff = 360 - diff;
+            if (diff <= 55) alignedCount++;
+            else if (diff >= 125) opposingCount++;
+        }
+        if ((alignedCount / hues.length) < 0.85 || (opposingCount / hues.length) >= 0.10) {
+            return { direction: 'TWO_WAY', label: 'Two-Way' };
+        }
+
+        // Compute segment compass bearing A -> B (0° = North, 90° = East, 180° = South, 270° = West)
+        const dLon = (endPt.lon - startPt.lon) * Math.cos(((startPt.lat + endPt.lat) / 2) * Math.PI / 180);
+        const dLat = endPt.lat - startPt.lat;
+        let bearingAB = Math.atan2(dLon, dLat) * 180 / Math.PI; // atan2(East, North)
+        if (bearingAB < 0) bearingAB += 360;
+
+        // Waze Color-by-Azimuth maps North ~ 0° (Red), East ~ 90° (Yellow-Green), South ~ 180° (Cyan), West ~ 270° (Blue-Purple)
+        let diffAB = Math.abs(domHue - bearingAB);
+        if (diffAB > 180) diffAB = 360 - diffAB;
+        const diffBA = 180 - diffAB;
+
+        if (diffAB <= 68) {
+            return { direction: 'A_TO_B', label: 'One-Way (A➔B)' };
+        }
+        if (diffBA <= 68) {
+            return { direction: 'B_TO_A', label: 'One-Way (B➔A)' };
+        }
+        return { direction: 'TWO_WAY', label: 'Two-Way' };
+    }
+
+    // Finds closest point on nearby drivable road within 34m to snap/extend an endpoint
+    function findEndpointSnapCandidate(endPt, neighborPt, segments, editorRank) {
+        const MAX_SNAP_METERS = 34;
+        const NODE_SNAP_METERS = 12;
+        const R = 6371000;
+        const cosLat = Math.max(0.1, Math.cos(endPt.lat * Math.PI / 180));
+        const mLon = (Math.PI / 180) * R * cosLat;
+        const mLat = (Math.PI / 180) * R;
+
+        let best = null;
+
+        for (const seg of segments) {
+            const pts = seg.wgsPoints;
+            if (!pts || pts.length < 2) continue;
+
+            // Check existing start/end nodes first (cleanest junction snap — no segment split needed!)
+            const endpoints = [
+                { pt: pts[0], nodeId: seg.fromNodeId },
+                { pt: pts[pts.length - 1], nodeId: seg.toNodeId }
+            ];
+            for (const ep of endpoints) {
+                const dNode = haversineDistanceMeters(endPt.lat, endPt.lon, ep.pt.lat, ep.pt.lon);
+                if (dNode <= MAX_SNAP_METERS && (!best || dNode < best.dist - 3 || (dNode <= NODE_SNAP_METERS && best.kind !== 'node'))) {
+                    const canConnect = (seg.roadType !== 3 && seg.lockRank <= editorRank);
+                    best = {
+                        kind: canConnect ? 'node' : 'short_locked',
+                        dist: dNode,
+                        seg,
+                        nodeId: ep.nodeId,
+                        snapLon: ep.pt.lon,
+                        snapLat: ep.pt.lat
+                    };
+                }
+            }
+
+            // Check perpendicular projection onto each segment leg
+            const px = (endPt.lon - pts[0].lon) * mLon;
+            const py = (endPt.lat - pts[0].lat) * mLat;
+
+            for (let i = 0; i < pts.length - 1; i++) {
+                const ax = (pts[i].lon - pts[0].lon) * mLon;
+                const ay = (pts[i].lat - pts[0].lat) * mLat;
+                const bx = (pts[i + 1].lon - pts[0].lon) * mLon;
+                const by = (pts[i + 1].lat - pts[0].lat) * mLat;
+
+                const dx = bx - ax, dy = by - ay;
+                const lenSq = dx * dx + dy * dy;
+                if (lenSq === 0) continue;
+                const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+                const projX = ax + t * dx;
+                const projY = ay + t * dy;
+                const dist = Math.hypot(px - projX, py - projY);
+
+                if (dist <= MAX_SNAP_METERS && (!best || dist < best.dist - 2)) {
+                    const projLon = pts[0].lon + projX / mLon;
+                    const projLat = pts[0].lat + projY / mLat;
+
+                    // If projection is within 12m of seg's own start/end vertex, snap directly to that vertex node!
+                    const dStart = haversineDistanceMeters(projLat, projLon, pts[0].lat, pts[0].lon);
+                    const dEnd = haversineDistanceMeters(projLat, projLon, pts[pts.length - 1].lat, pts[pts.length - 1].lon);
+                    const canConnect = (seg.roadType !== 3 && seg.lockRank <= editorRank);
+
+                    if (dStart <= NODE_SNAP_METERS) {
+                        best = {
+                            kind: canConnect ? 'node' : 'short_locked',
+                            dist,
+                            seg,
+                            nodeId: seg.fromNodeId,
+                            snapLon: pts[0].lon,
+                            snapLat: pts[0].lat
+                        };
+                    } else if (dEnd <= NODE_SNAP_METERS) {
+                        best = {
+                            kind: canConnect ? 'node' : 'short_locked',
+                            dist,
+                            seg,
+                            nodeId: seg.toNodeId,
+                            snapLon: pts[pts.length - 1].lon,
+                            snapLat: pts[pts.length - 1].lat
+                        };
+                    } else {
+                        best = {
+                            kind: canConnect ? 'split' : 'short_locked',
+                            dist,
+                            seg,
+                            nodeId: null,
+                            snapLon: projLon,
+                            snapLat: projLat
+                        };
+                    }
+                }
+            }
+        }
+
+        if (!best) return null;
+
+        // If target road is locked above editor rank or is a Freeway, stop 4.0m short of the road!
+        if (best.kind === 'short_locked') {
+            const totalD = haversineDistanceMeters(neighborPt.lat, neighborPt.lon, best.snapLat, best.snapLon);
+            if (totalD > 6) {
+                const ratio = (totalD - 4.0) / totalD;
+                best.stopLon = neighborPt.lon + (best.snapLon - neighborPt.lon) * ratio;
+                best.stopLat = neighborPt.lat + (best.snapLat - neighborPt.lat) * ratio;
+            } else {
+                best.stopLon = endPt.lon;
+                best.stopLat = endPt.lat;
+            }
+        }
+
+        return best;
+    }
+
+    async function splitTargetSegmentAtPoint(segId, lon, lat) {
+        // 1. Official WME SDK splitSegment
+        if (wmeSDK && wmeSDK.DataModel && wmeSDK.DataModel.Segments && typeof wmeSDK.DataModel.Segments.splitSegment === 'function') {
+            try {
+                await Promise.resolve(wmeSDK.DataModel.Segments.splitSegment({
+                    segmentId: segId,
+                    lonLat: { lon, lat },
+                    point: { x: lon, y: lat, lon, lat }
+                }));
+                return true;
+            } catch (e) {
+                try {
+                    await Promise.resolve(wmeSDK.DataModel.Segments.splitSegment({
+                        segmentId: segId,
+                        point: { type: 'Point', coordinates: [lon, lat] }
+                    }));
+                    return true;
+                } catch (e2) {}
+            }
+        }
+
+        // 2. Legacy WME SplitSegments action
+        if (win.W && win.W.model && win.W.model.segments && win.OpenLayers) {
+            try {
+                const SplitAction = win.require ? win.require('Waze/Action/SplitSegments') : (win.W.Action && win.W.Action.SplitSegments);
+                const segModel = win.W.model.segments.getObjectById(segId);
+                const am = (win.W.model && win.W.model.actionManager) || (win.W.controller && win.W.controller.actionManager);
+                if (SplitAction && segModel && am) {
+                    const m = latLonToMercator(lat, lon);
+                    const ptGeom = new win.OpenLayers.Geometry.Point(m.x, m.y);
+                    am.add(new SplitAction(segModel, { splitAtPoint: ptGeom }));
+                    return true;
+                }
+            } catch (e) {}
+        }
+        return false;
+    }
+
+    function connectLegacySegmentToNearbyNode(newSegModel, snapLon, snapLat) {
+        if (!newSegModel || !win.W || !win.W.model || !win.W.model.nodes) return false;
+        try {
+            const ConnectSegment = win.require ? win.require('Waze/Action/ConnectSegment') : (win.W.Action && win.W.Action.ConnectSegment);
+            const ModifyAllConnections = win.require ? win.require('Waze/Action/ModifyAllConnections') : null;
+            const am = (win.W.model && win.W.model.actionManager) || (win.W.controller && win.W.controller.actionManager);
+            if (!ConnectSegment || !am) return false;
+
+            const nodes = typeof win.W.model.nodes.getObjectArray === 'function'
+                ? win.W.model.nodes.getObjectArray()
+                : Object.values(win.W.model.nodes.objects || {});
+
+            let nearestNode = null;
+            let bestD = 8.0; // Within 8 meters of snap coordinate
+            for (const n of nodes) {
+                if (!n || !n.geometry) continue;
+                const wgs = toWgsPoint(n.geometry.x, n.geometry.y);
+                if (!wgs) continue;
+                const d = haversineDistanceMeters(snapLat, snapLon, wgs.lat, wgs.lon);
+                if (d < bestD) {
+                    bestD = d;
+                    nearestNode = n;
+                }
+            }
+            if (nearestNode) {
+                am.add(new ConnectSegment(nearestNode, newSegModel));
+                if (ModifyAllConnections) {
+                    try { am.add(new ModifyAllConnections(nearestNode, true)); } catch (e) {}
+                }
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    async function enableSdkTurnsForSegment(newSegId) {
+        if (!newSegId || !wmeSDK || !wmeSDK.DataModel || !wmeSDK.DataModel.Turns) return;
+        try {
+            const Turns = wmeSDK.DataModel.Turns;
+            if (typeof Turns.getTurnsFromSegment === 'function' && typeof Turns.updateTurn === 'function') {
+                const fromTurns = await Promise.resolve(Turns.getTurnsFromSegment({ segmentId: newSegId })) || [];
+                const toTurns = typeof Turns.getTurnsToSegment === 'function'
+                    ? (await Promise.resolve(Turns.getTurnsToSegment({ segmentId: newSegId })) || [])
+                    : [];
+                for (const t of [...fromTurns, ...toTurns]) {
+                    if (t && t.isAllowed === false) {
+                        try {
+                            await Promise.resolve(Turns.updateTurn({
+                                turnId: t.id,
+                                fromSegmentId: t.fromSegmentId,
+                                toSegmentId: t.toSegmentId,
+                                isAllowed: true
+                            }));
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    async function applyAddressLockAndDirection(newSegId, newSegModel, refSeg, targetLockRank, directionCode) {
+        // 1. Update Lock Rank & Direction via WME SDK
+        if (newSegId && wmeSDK && wmeSDK.DataModel && wmeSDK.DataModel.Segments && typeof wmeSDK.DataModel.Segments.updateSegment === 'function') {
+            try {
+                const upd = { segmentId: newSegId };
+                if (typeof targetLockRank === 'number' && targetLockRank >= 0) upd.lockRank = targetLockRank;
+                if (directionCode) upd.direction = directionCode; // 'TWO_WAY' | 'A_TO_B' | 'B_TO_A'
+                await Promise.resolve(wmeSDK.DataModel.Segments.updateSegment(upd));
+            } catch (e) {
+                // Try lockRank and direction individually if combined call differs by SDK build
+                try {
+                    if (typeof targetLockRank === 'number' && targetLockRank > 0) {
+                        await Promise.resolve(wmeSDK.DataModel.Segments.updateSegment({ segmentId: newSegId, lockRank: targetLockRank }));
+                    }
+                } catch (e2) {}
+                try {
+                    if (directionCode && directionCode !== 'TWO_WAY') {
+                        await Promise.resolve(wmeSDK.DataModel.Segments.updateSegment({ segmentId: newSegId, direction: directionCode }));
+                    }
+                } catch (e3) {}
+            }
+        }
+
+        // Legacy WME fallback for Lock Rank & Direction
+        if (win.W && win.W.model) {
+            try {
+                const segObj = newSegModel || (newSegId && win.W.model.segments && win.W.model.segments.getObjectById(newSegId));
+                const UpdateObject = win.require ? win.require('Waze/Action/UpdateObject') : (win.W.Action && win.W.Action.UpdateObject);
+                const am = (win.W.model && win.W.model.actionManager) || (win.W.controller && win.W.controller.actionManager);
+                if (segObj && UpdateObject && am) {
+                    const changes = {};
+                    if (typeof targetLockRank === 'number' && targetLockRank >= 0) changes.lockRank = targetLockRank;
+                    if (directionCode === 'A_TO_B') { changes.fwdDirection = true; changes.revDirection = false; }
+                    else if (directionCode === 'B_TO_A') { changes.fwdDirection = false; changes.revDirection = true; }
+                    else { changes.fwdDirection = true; changes.revDirection = true; }
+                    am.add(new UpdateObject(segObj, changes));
+                }
+            } catch (e) {}
+        }
+
+        // 2. Auto-inherit City & State from neighbor road AND set Street Name to 'None' (empty street)
+        if (!refSeg || !refSeg.primaryStreetId) return false;
+        let addressSet = false;
+
+        // SDK Street / City lookup
+        if (newSegId && wmeSDK && wmeSDK.DataModel && wmeSDK.DataModel.Streets) {
+            try {
+                const Streets = wmeSDK.DataModel.Streets;
+                const parentStreet = typeof Streets.getById === 'function'
+                    ? await Promise.resolve(Streets.getById({ streetId: refSeg.primaryStreetId }))
+                    : null;
+                const cityId = parentStreet && (parentStreet.cityId ?? parentStreet.cityID);
+
+                if (cityId !== undefined && cityId !== null) {
+                    let emptyStreet = null;
+                    if (typeof Streets.getStreet === 'function') {
+                        try { emptyStreet = await Promise.resolve(Streets.getStreet({ cityId, streetName: '' })); } catch (e) {}
+                    }
+                    if (!emptyStreet && typeof Streets.getAll === 'function') {
+                        const allSt = await Promise.resolve(Streets.getAll()) || [];
+                        emptyStreet = allSt.find(s => s && (s.cityId === cityId) && (s.isEmpty || !s.name || s.name === ''));
+                    }
+                    if (!emptyStreet && typeof Streets.addStreet === 'function') {
+                        try { emptyStreet = await Promise.resolve(Streets.addStreet({ streetName: '', cityId })); } catch (e) {}
+                    }
+                    if (emptyStreet && emptyStreet.id && typeof wmeSDK.DataModel.Segments.updateAddress === 'function') {
+                        await Promise.resolve(wmeSDK.DataModel.Segments.updateAddress({
+                            segmentId: newSegId,
+                            primaryStreetId: emptyStreet.id
+                        }));
+                        addressSet = true;
+                    } else if (typeof wmeSDK.DataModel.Segments.updateAddress === 'function') {
+                        const Cities = wmeSDK.DataModel.Cities;
+                        const cityObj = (Cities && typeof Cities.getById === 'function')
+                            ? await Promise.resolve(Cities.getById({ cityId }))
+                            : null;
+                        await Promise.resolve(wmeSDK.DataModel.Segments.updateAddress({
+                            segmentId: newSegId,
+                            addressData: {
+                                streetName: '',
+                                emptyStreet: true,
+                                cityName: cityObj ? (cityObj.name || '') : ''
+                            }
+                        }));
+                        addressSet = true;
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Legacy W.model UpdateFeatureAddress fallback (rock-solid across WME versions!)
+        if (!addressSet && win.W && win.W.model && win.W.model.streets && win.W.model.cities) {
+            try {
+                const segObj = newSegModel || (newSegId && win.W.model.segments && win.W.model.segments.getObjectById(newSegId));
+                const parentStreet = win.W.model.streets.getObjectById(refSeg.primaryStreetId);
+                const cityID = parentStreet && (parentStreet.attributes ? parentStreet.attributes.cityID : parentStreet.cityID);
+                const cityObj = (cityID !== undefined && cityID !== null) ? win.W.model.cities.getObjectById(cityID) : null;
+                const UpdateFeatureAddress = win.require ? win.require('Waze/Action/UpdateFeatureAddress') : (win.W.Action && win.W.Action.UpdateFeatureAddress);
+                const am = (win.W.model && win.W.model.actionManager) || (win.W.controller && win.W.controller.actionManager);
+
+                if (segObj && cityObj && UpdateFeatureAddress && am) {
+                    const cAttrs = cityObj.attributes || cityObj;
+                    am.add(new UpdateFeatureAddress(segObj, {
+                        countryID: cAttrs.countryID,
+                        stateID: cAttrs.stateID,
+                        cityName: cAttrs.isEmpty ? '' : (cAttrs.name || ''),
+                        emptyCity: Boolean(cAttrs.isEmpty),
+                        streetName: '',
+                        emptyStreet: true
+                    }));
+                    addressSet = true;
+                }
+            } catch (e) {}
+        }
+
+        return addressSet;
+    }
+
+    function selectSegmentInWme(newSegId, newSegModel) {
+        if (newSegId && wmeSDK && wmeSDK.Editing && typeof wmeSDK.Editing.setSelection === 'function') {
+            try {
+                wmeSDK.Editing.setSelection({
+                    selection: { ids: [newSegId], objectType: 'segment' }
+                });
+                return;
+            } catch (e) {}
+        }
+        if (win.W && win.W.selectionManager && typeof win.W.selectionManager.setSelectedModels === 'function') {
+            try {
+                const segObj = newSegModel || (newSegId && win.W.model?.segments?.getObjectById?.(newSegId));
+                if (segObj) win.W.selectionManager.setSelectedModels([segObj]);
+            } catch (e) {}
+        }
+    }
+
     async function drawDraftRoad(stretchId) {
         const stretchIdx = currentResults.stretches.findIndex(s => s.id === stretchId);
         const stretch = stretchIdx >= 0 ? currentResults.stretches[stretchIdx] : null;
@@ -2318,59 +3037,165 @@
         }
 
         activeStretchIndex = stretchIdx;
-        suppressAutoScanUntil = Date.now() + 3000;
+        suppressAutoScanUntil = Date.now() + 3500;
         await goToLocationAndVerifyZoom(stretch.centerLat, stretch.centerLon, 18);
+        await new Promise(res => setTimeout(res, 250)); // Let WME hydrate nearby segments at Zoom 18
 
         const cleanRoadNodes = buildMinimalNodeRoadPoints(stretch.points, settings.drawSimplifyToleranceMeters || 8);
-        const internalNodes = Math.max(0, cleanRoadNodes.length - 2);
+        if (cleanRoadNodes.length < 2) return;
+
+        const segments = getLoadedSegments();
+        const editorRank = getEditorLockRank();
+
+        // 1. Rank-Safe Endpoint Extension & Junction Snapping
+        const startSnap = findEndpointSnapCandidate(cleanRoadNodes[0], cleanRoadNodes[1], segments, editorRank);
+        const endSnap = findEndpointSnapCandidate(
+            cleanRoadNodes[cleanRoadNodes.length - 1],
+            cleanRoadNodes[cleanRoadNodes.length - 2],
+            segments,
+            editorRank
+        );
+
+        let snappedCount = 0;
+        let stoppedShortCount = 0;
+        const connectedParentSegs = [];
+
+        if (startSnap) {
+            if (startSnap.kind === 'split') {
+                await splitTargetSegmentAtPoint(startSnap.seg.id, startSnap.snapLon, startSnap.snapLat);
+                cleanRoadNodes[0] = { lon: startSnap.snapLon, lat: startSnap.snapLat };
+                connectedParentSegs.push(startSnap.seg);
+                snappedCount++;
+            } else if (startSnap.kind === 'node') {
+                cleanRoadNodes[0] = { lon: startSnap.snapLon, lat: startSnap.snapLat };
+                connectedParentSegs.push(startSnap.seg);
+                snappedCount++;
+            } else if (startSnap.kind === 'short_locked') {
+                cleanRoadNodes[0] = { lon: startSnap.stopLon, lat: startSnap.stopLat };
+                stoppedShortCount++;
+            }
+        }
+
+        if (endSnap && (!startSnap || endSnap.seg.id !== startSnap.seg.id || haversineDistanceMeters(cleanRoadNodes[0].lat, cleanRoadNodes[0].lon, endSnap.snapLat, endSnap.snapLon) > 12)) {
+            const lastI = cleanRoadNodes.length - 1;
+            if (endSnap.kind === 'split') {
+                await splitTargetSegmentAtPoint(endSnap.seg.id, endSnap.snapLon, endSnap.snapLat);
+                cleanRoadNodes[lastI] = { lon: endSnap.snapLon, lat: endSnap.snapLat };
+                connectedParentSegs.push(endSnap.seg);
+                snappedCount++;
+            } else if (endSnap.kind === 'node') {
+                cleanRoadNodes[lastI] = { lon: endSnap.snapLon, lat: endSnap.snapLat };
+                connectedParentSegs.push(endSnap.seg);
+                snappedCount++;
+            } else if (endSnap.kind === 'short_locked') {
+                cleanRoadNodes[lastI] = { lon: endSnap.stopLon, lat: endSnap.stopLat };
+                stoppedShortCount++;
+            }
+        }
+
+        // Determine reference neighbor segment (for City/State & Lock Rank)
+        let refSeg = connectedParentSegs[0] || (startSnap && startSnap.seg) || (endSnap && endSnap.seg) || null;
+        if (!refSeg && segments.length > 0) {
+            let bestD = Infinity;
+            for (const s of segments) {
+                const d = haversineDistanceMeters(stretch.centerLat, stretch.centerLon, s.wgsPoints[0].lat, s.wgsPoints[0].lon);
+                if (d < bestD) { bestD = d; refSeg = s; }
+            }
+        }
+
+        // Match connected road's lock rank, capped at editor's own rank
+        let targetLockRank = 0;
+        if (connectedParentSegs.length > 0) {
+            const minParentLock = Math.min(...connectedParentSegs.map(s => s.lockRank || 0));
+            targetLockRank = Math.min(editorRank, Math.max(0, minParentLock));
+        } else if (refSeg) {
+            targetLockRank = Math.min(editorRank, Math.max(0, refSeg.lockRank || 0));
+        }
+
+        // Detect One-Way vs Two-Way from GPS arrow colors
+        const dirInfo = detectRoadDirectionFromGpsHues(stretch.points, cleanRoadNodes[0], cleanRoadNodes[cleanRoadNodes.length - 1]);
 
         let createdViaSdk = false;
+        let newSegId = null;
+        let newSegModel = null;
 
-        // 1. Official WME SDK segment creation
+        // 2. Create standard Street (roadType: 1) via WME SDK
         if (wmeSDK && wmeSDK.DataModel && wmeSDK.DataModel.Segments && typeof wmeSDK.DataModel.Segments.addSegment === 'function') {
             try {
                 const geoJsonCoords = cleanRoadNodes.map(p => [p.lon, p.lat]);
-                await Promise.resolve(wmeSDK.DataModel.Segments.addSegment({
+                const res = await Promise.resolve(wmeSDK.DataModel.Segments.addSegment({
                     geometry: {
                         type: 'LineString',
                         coordinates: geoJsonCoords
                     },
                     roadType: 1
                 }));
+                newSegId = (typeof res === 'number' || typeof res === 'string') ? res : (res && res.id) || null;
                 createdViaSdk = true;
-                showToast(`🛣️ Straight Street drawn (${internalNodes} intermediate node${internalNodes === 1 ? '' : 's'})! Connect & save.`, 'success');
             } catch (e) {}
         }
 
-        // 2. Legacy W.Action.AddSegment
-        if (!createdViaSdk && win.W && win.W.model && win.W.controller && win.W.controller.actionManager) {
+        // 3. Fallback: Legacy W.Action.AddSegment
+        if (!createdViaSdk && win.W && win.W.model && win.OpenLayers) {
             try {
                 const AddSegmentAction = win.require ? win.require('Waze/Action/AddSegment') : (win.W.Action && win.W.Action.AddSegment);
                 const SegmentFeature = win.require ? win.require('Waze/Feature/Vector/Segment') : (win.W.Feature && win.W.Feature.Vector && win.W.Feature.Vector.Segment);
+                const am = (win.W.model && win.W.model.actionManager) || (win.W.controller && win.W.controller.actionManager);
 
-                if (AddSegmentAction && SegmentFeature && win.OpenLayers) {
+                if (AddSegmentAction && SegmentFeature && am) {
                     const olComponents = cleanRoadNodes.map(p => {
                         const m = latLonToMercator(p.lat, p.lon);
                         return new win.OpenLayers.Geometry.Point(m.x, m.y);
                     });
                     const lineGeom = new win.OpenLayers.Geometry.LineString(olComponents);
-                    const seg = new SegmentFeature(lineGeom, {
-                        roadType: 1,
-                        flags: 0
-                    });
-                    win.W.controller.actionManager.add(new AddSegmentAction(seg));
+                    newSegModel = new SegmentFeature(lineGeom, { roadType: 1, lockRank: targetLockRank });
+                    am.add(new AddSegmentAction(newSegModel));
+                    newSegId = newSegModel.attributes ? newSegModel.attributes.id : newSegModel.id;
                     createdViaSdk = true;
-                    showToast(`🛣️ Straight Street added (${internalNodes} intermediate node${internalNodes === 1 ? '' : 's'})!`, 'success');
                 }
             } catch (e) {}
         }
 
-        // 3. Fallback: activate WME road drawing tool
         if (!createdViaSdk) {
             showToast("Centered at Zoom 18. Press 'I' or click Road tool to trace the highlighted centerline!", 'info');
             const roadToolBtn = document.querySelector('#toolbar .toolbar-button-road, .wz-header-item-road');
             if (roadToolBtn) roadToolBtn.click();
+            return;
         }
+
+        // 4. Ensure junction node connections & enable turns
+        if (snappedCount > 0) {
+            const segObj = newSegModel || (newSegId && win.W?.model?.segments?.getObjectById?.(newSegId));
+            if (segObj) {
+                if (startSnap && (startSnap.kind === 'node' || startSnap.kind === 'split')) {
+                    connectLegacySegmentToNearbyNode(segObj, startSnap.snapLon, startSnap.snapLat);
+                }
+                if (endSnap && (endSnap.kind === 'node' || endSnap.kind === 'split')) {
+                    connectLegacySegmentToNearbyNode(segObj, endSnap.snapLon, endSnap.snapLat);
+                }
+            }
+            if (newSegId) {
+                await enableSdkTurnsForSegment(newSegId);
+            }
+        }
+
+        // 5. Apply City/State + Street Name='None', Lock Rank (L1..Ln), & One-Way/Two-Way direction
+        await applyAddressLockAndDirection(newSegId, newSegModel, refSeg, targetLockRank, dirInfo.direction);
+
+        // 6. Select the newly drawn road so WME's left attribute panel opens immediately!
+        selectSegmentInWme(newSegId, newSegModel);
+
+        // 7. Track stretch for auto-Done on WME Save & display Road Type / Direction reminder!
+        lastDrawnStretchId = stretch.id;
+        const venueCtx = isInsideParkingLotOrGasVenue(stretch.centerLon, stretch.centerLat);
+        const venueHint = venueCtx ? ` (🅿️ inside ${venueCtx} — check if Parking Lot/Private Road!)` : ' (Street vs PLR / Private / Dirt)';
+        const snapSummary = stoppedShortCount > 0
+            ? `Stopped 4m short of locked/Freeway road`
+            : (snappedCount > 0 ? `Snapped ${snappedCount} junction(s)` : 'Placed segment');
+
+        lastDrawReminderMsg = `⚠️ CHECK ROAD TYPE${venueHint} • ${dirInfo.label} • L${targetLockRank + 1} Lock • Street='None' (${snapSummary}). Save in WME to auto-advance!`;
+        updateStatusText(lastDrawReminderMsg);
+        showToast(`🛣️ Road drawn (${dirInfo.label}, L${targetLockRank + 1})! ⚠️ Check Road Type${venueCtx ? ' (' + venueCtx + ')' : ''} & Turns before saving!`, 'warning');
 
         renderAlertList();
     }
@@ -2966,62 +3791,96 @@
         return mercatorToLatLon(mx, my);
     }
 
-    function renderHighlights(stretches, unmappedPoints) {
+    function renderHighlights(stretches) {
         const svg = getOrCreateOverlaySvg();
         clearHighlights();
 
-        if (stretches.length === 0 && unmappedPoints.length === 0) return;
+        if (!stretches || stretches.length === 0) return;
 
         const mapDiv = getMapViewportElement();
         const w = mapDiv ? mapDiv.clientWidth : win.innerWidth;
         const h = mapDiv ? mapDiv.clientHeight : win.innerHeight;
 
-        // Draw glowing circles on unmapped GPS points inside current screen bounds
-        for (const pt of unmappedPoints) {
-            const pixel = coordsToPixel(pt.lon, pt.lat);
-            if (!pixel || pixel.x < -20 || pixel.y < -20 || pixel.x > w + 20 || pixel.y > h + 20) continue;
-
-            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-            circle.setAttribute('cx', pixel.x.toFixed(1));
-            circle.setAttribute('cy', pixel.y.toFixed(1));
-            circle.setAttribute('r', '5.5');
-            circle.setAttribute('fill', settings.highlightColor);
-            circle.setAttribute('stroke', '#ffffff');
-            circle.setAttribute('stroke-width', '1.5');
-            circle.setAttribute('filter', 'url(#roadGlow)');
-            circle.setAttribute('opacity', '0.9');
-            svg.appendChild(circle);
+        // Optional debug dots ONLY if explicitly enabled in Settings (OFF by default so map stays clean!)
+        if (settings.showRawGpsDots) {
+            const rawPts = stretches.flatMap(s => s.points || []);
+            for (const pt of rawPts) {
+                const pixel = coordsToPixel(pt.lon, pt.lat);
+                if (!pixel || pixel.x < -20 || pixel.y < -20 || pixel.x > w + 20 || pixel.y > h + 20) continue;
+                const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                dot.setAttribute('cx', pixel.x.toFixed(1));
+                dot.setAttribute('cy', pixel.y.toFixed(1));
+                dot.setAttribute('r', '2.5');
+                dot.setAttribute('fill', settings.highlightColor);
+                dot.setAttribute('opacity', '0.5');
+                svg.appendChild(dot);
+            }
         }
 
-        // Draw stretch trajectory paths and clickable badges
-        for (const stretch of stretches) {
-            const centerPixel = coordsToPixel(stretch.centerLon, stretch.centerLat);
-            if (!centerPixel || centerPixel.x < -100 || centerPixel.y < -100 || centerPixel.x > w + 100 || centerPixel.y > h + 100) {
-                continue;
-            }
-
+        // Render clean, smoothed road-centerline highlights + endpoint anchor rings
+        stretches.forEach((stretch, idx) => {
             const cleanLine = buildMinimalNodeRoadPoints(stretch.points, settings.drawSimplifyToleranceMeters || 8);
-            if (cleanLine.length > 1) {
-                let pathData = '';
-                for (let i = 0; i < cleanLine.length; i++) {
-                    const p = coordsToPixel(cleanLine[i].lon, cleanLine[i].lat);
-                    if (!p) continue;
-                    pathData += (pathData === '' ? `M ${p.x.toFixed(1)} ${p.y.toFixed(1)}` : ` L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`);
+            const screenPts = cleanLine.map(p => coordsToPixel(p.lon, p.lat)).filter(Boolean);
+
+            const centerPixel = coordsToPixel(stretch.centerLon, stretch.centerLat);
+            const anchorPixel = screenPts.length >= 2
+                ? {
+                    x: (screenPts[Math.floor((screenPts.length - 1) / 2)].x + screenPts[Math.ceil((screenPts.length - 1) / 2)].x) / 2,
+                    y: (screenPts[Math.floor((screenPts.length - 1) / 2)].y + screenPts[Math.ceil((screenPts.length - 1) / 2)].y) / 2
                 }
-                if (pathData) {
-                    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-                    path.setAttribute('d', pathData);
-                    path.setAttribute('stroke', settings.highlightGlow);
-                    path.setAttribute('stroke-width', '3.5');
-                    path.setAttribute('stroke-dasharray', '6,4');
-                    path.setAttribute('fill', 'none');
-                    path.setAttribute('opacity', '0.9');
-                    svg.appendChild(path);
+                : centerPixel;
+
+            if (!anchorPixel || anchorPixel.x < -200 || anchorPixel.y < -200 || anchorPixel.x > w + 200 || anchorPixel.y > h + 200) {
+                return;
+            }
+
+            const isFocused = (idx === activeStretchIndex);
+
+            if (screenPts.length >= 2) {
+                let pathData = '';
+                for (let i = 0; i < screenPts.length; i++) {
+                    pathData += (i === 0 ? `M ${screenPts[i].x.toFixed(1)} ${screenPts[i].y.toFixed(1)}` : ` L ${screenPts[i].x.toFixed(1)} ${screenPts[i].y.toFixed(1)}`);
+                }
+
+                // Soft outer road-corridor halo
+                const halo = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                halo.setAttribute('d', pathData);
+                halo.setAttribute('stroke', isFocused ? '#38bdf8' : settings.highlightColor);
+                halo.setAttribute('stroke-width', isFocused ? '11' : '9');
+                halo.setAttribute('stroke-linecap', 'round');
+                halo.setAttribute('stroke-linejoin', 'round');
+                halo.setAttribute('fill', 'none');
+                halo.setAttribute('opacity', isFocused ? '0.38' : '0.28');
+                svg.appendChild(halo);
+
+                // Smooth solid centerline (no jagged dashes)
+                const centerStroke = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                centerStroke.setAttribute('d', pathData);
+                centerStroke.setAttribute('stroke', settings.highlightGlow);
+                centerStroke.setAttribute('stroke-width', '3.5');
+                centerStroke.setAttribute('stroke-linecap', 'round');
+                centerStroke.setAttribute('stroke-linejoin', 'round');
+                centerStroke.setAttribute('fill', 'none');
+                centerStroke.setAttribute('opacity', '0.95');
+                svg.appendChild(centerStroke);
+
+                // Clean start & end node rings only (shows exact minimal geometry vertices!)
+                for (let i = 0; i < screenPts.length; i++) {
+                    const isEnd = (i === 0 || i === screenPts.length - 1);
+                    const nodeRing = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                    nodeRing.setAttribute('cx', screenPts[i].x.toFixed(1));
+                    nodeRing.setAttribute('cy', screenPts[i].y.toFixed(1));
+                    nodeRing.setAttribute('r', isEnd ? '4.2' : '3.2');
+                    nodeRing.setAttribute('fill', '#ffffff');
+                    nodeRing.setAttribute('stroke', isFocused ? '#0284c7' : settings.highlightColor);
+                    nodeRing.setAttribute('stroke-width', '2');
+                    svg.appendChild(nodeRing);
                 }
             }
 
+            // Compact clickable badge
             const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-            g.setAttribute('transform', `translate(${centerPixel.x.toFixed(1)}, ${(centerPixel.y - 18).toFixed(1)})`);
+            g.setAttribute('transform', `translate(${anchorPixel.x.toFixed(1)}, ${(anchorPixel.y - 16).toFixed(1)})`);
             g.setAttribute('style', 'pointer-events: auto; cursor: pointer;');
             g.onclick = () => {
                 const sIdx = currentResults.stretches.findIndex(item => item.id === stretch.id);
@@ -3030,116 +3889,193 @@
             };
 
             const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', '-52');
-            rect.setAttribute('y', '-14');
-            rect.setAttribute('width', '104');
-            rect.setAttribute('height', '26');
-            rect.setAttribute('rx', '13');
-            rect.setAttribute('fill', '#1a1f2c');
-            rect.setAttribute('stroke', settings.highlightColor);
-            rect.setAttribute('stroke-width', '2');
-            rect.setAttribute('filter', 'url(#roadGlow)');
+            rect.setAttribute('x', '-38');
+            rect.setAttribute('y', '-12');
+            rect.setAttribute('width', '76');
+            rect.setAttribute('height', '22');
+            rect.setAttribute('rx', '11');
+            rect.setAttribute('fill', '#0f172a');
+            rect.setAttribute('stroke', isFocused ? '#38bdf8' : settings.highlightColor);
+            rect.setAttribute('stroke-width', '1.8');
 
             const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
             text.setAttribute('x', '0');
             text.setAttribute('y', '3');
             text.setAttribute('text-anchor', 'middle');
             text.setAttribute('fill', '#ffffff');
-            text.setAttribute('font-size', '11px');
+            text.setAttribute('font-size', '10.5px');
             text.setAttribute('font-weight', 'bold');
             text.setAttribute('font-family', 'sans-serif');
-            text.textContent = `🛣️ Stretch #${stretch.id}`;
+            text.textContent = `🛣️ #${stretch.id}`;
 
             g.appendChild(rect);
             g.appendChild(text);
             svg.appendChild(g);
-        }
+        });
     }
 
     /* ==========================================================================
-       11. DRAGGABLE UI, COMPACT FIXER MINI-WINDOW & COMPILED QUEUE
+       11. DRAGGABLE WAZE-BLUE UI, COMPACT FIXER MINI-WINDOW & COMPILED QUEUE
        ========================================================================== */
     function applySavedPanelPosition(panel) {
         if (!panel) return;
-        const vw = win.innerWidth || 1280;
-        const vh = win.innerHeight || 800;
-        const pw = panel.offsetWidth || (settings.uiMode === 'compact' ? 276 : 356);
+        const docEl = (panel.ownerDocument || document).documentElement;
+        const vw = (docEl && docEl.clientWidth) || win.innerWidth || 1280;
+        const vh = (docEl && docEl.clientHeight) || win.innerHeight || 800;
+        const pw = panel.offsetWidth || (settings.uiMode === 'compact' ? 318 : 392);
 
         if (Number.isFinite(settings.panelLeft) && Number.isFinite(settings.panelTop)) {
-            const clampedLeft = Math.max(8, Math.min(vw - Math.min(pw, 260) - 8, settings.panelLeft));
-            const clampedTop = Math.max(8, Math.min(vh - 46, settings.panelTop));
-            panel.style.left = `${Math.round(clampedLeft)}px`;
-            panel.style.top = `${Math.round(clampedTop)}px`;
-            panel.style.right = 'auto';
+            const clampedLeft = Math.max(6, Math.min(vw - Math.min(pw, 280) - 6, settings.panelLeft));
+            const clampedTop = Math.max(6, Math.min(vh - 48, settings.panelTop));
+            panel.style.setProperty('left', `${Math.round(clampedLeft)}px`, 'important');
+            panel.style.setProperty('top', `${Math.round(clampedTop)}px`, 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
         } else {
-            panel.style.top = '85px';
-            panel.style.right = '20px';
-            panel.style.left = 'auto';
+            panel.style.setProperty('top', '80px', 'important');
+            panel.style.setProperty('right', '18px', 'important');
+            panel.style.setProperty('left', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
         }
     }
 
+    // Bulletproof cross-realm dragging: binds capture-phase mouse + pointer + touch directly on
+    // BOTH ownerDocument AND page document (fixes Tampermonkey synthetic window proxy eating moves!)
     function makePanelDraggable(panel, header) {
         let dragging = false;
         let hasMoved = false;
         let startX = 0, startY = 0;
         let origLeft = 0, origTop = 0;
 
-        header.addEventListener('pointerdown', (e) => {
-            if (e.button !== 0) return;
-            // Don't start drag when clicking interactive pills/buttons inside header
-            if (e.target.closest('.nar-hdr-ctrl')) return;
+        const ownerDoc = panel.ownerDocument || document;
+        const pageDoc = (win && win.document && win.document !== ownerDoc) ? win.document : null;
 
-            dragging = true;
-            hasMoved = false;
-            const rect = panel.getBoundingClientRect();
-            startX = e.clientX;
-            startY = e.clientY;
-            origLeft = rect.left;
-            origTop = rect.top;
-            header.style.cursor = 'grabbing';
-            try { header.setPointerCapture(e.pointerId); } catch (err) {}
-        });
+        function isNonDragControl(target) {
+            if (!target || !target.closest) return false;
+            // Allow dragging even if grabbing the Zoom pill; only block <button>, <select>, <input>
+            return Boolean(target.closest('button, select, input, textarea, a'));
+        }
 
-        header.addEventListener('pointermove', (e) => {
+        function onMove(clientX, clientY, rawEvent) {
             if (!dragging) return;
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
+            if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
+
+            const dx = clientX - startX;
+            const dy = clientY - startY;
             if (!hasMoved && Math.hypot(dx, dy) > 4) {
                 hasMoved = true;
             }
             if (!hasMoved) return;
 
-            const vw = win.innerWidth || 1280;
-            const vh = win.innerHeight || 800;
-            const pw = panel.offsetWidth || 276;
-            const newLeft = Math.max(6, Math.min(vw - pw - 6, origLeft + dx));
-            const newTop = Math.max(6, Math.min(vh - 44, origTop + dy));
+            if (rawEvent && rawEvent.cancelable) rawEvent.preventDefault();
 
-            panel.style.left = `${Math.round(newLeft)}px`;
-            panel.style.top = `${Math.round(newTop)}px`;
-            panel.style.right = 'auto';
-        });
+            const docEl = ownerDoc.documentElement;
+            const vw = (docEl && docEl.clientWidth) || win.innerWidth || 1280;
+            const vh = (docEl && docEl.clientHeight) || win.innerHeight || 800;
+            const pw = panel.offsetWidth || 318;
+            const newLeft = Math.max(4, Math.min(vw - pw - 4, origLeft + dx));
+            const newTop = Math.max(4, Math.min(vh - 46, origTop + dy));
 
-        function finishDrag(e) {
+            panel.style.setProperty('left', `${Math.round(newLeft)}px`, 'important');
+            panel.style.setProperty('top', `${Math.round(newTop)}px`, 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
+        }
+
+        function onMouseOrPointerMove(e) {
+            onMove(e.clientX, e.clientY, e);
+        }
+
+        function onTouchMove(e) {
+            if (e.touches && e.touches.length > 0) {
+                onMove(e.touches[0].clientX, e.touches[0].clientY, e);
+            }
+        }
+
+        function removeAllMoveListeners() {
+            const targets = [ownerDoc, pageDoc, window, (win !== window ? win : null)].filter(Boolean);
+            for (const t of targets) {
+                try {
+                    t.removeEventListener('mousemove', onMouseOrPointerMove, true);
+                    t.removeEventListener('pointermove', onMouseOrPointerMove, true);
+                    t.removeEventListener('mouseup', onEnd, true);
+                    t.removeEventListener('pointerup', onEnd, true);
+                    t.removeEventListener('touchmove', onTouchMove, true);
+                    t.removeEventListener('touchend', onEnd, true);
+                } catch (e) {}
+            }
+        }
+
+        function onEnd() {
             if (!dragging) return;
             dragging = false;
-            header.style.cursor = 'grab';
-            try { header.releasePointerCapture(e.pointerId); } catch (err) {}
+            header.style.setProperty('cursor', 'grab', 'important');
+            removeAllMoveListeners();
 
             if (hasMoved) {
                 const rect = panel.getBoundingClientRect();
                 settings.panelLeft = Math.round(rect.left);
                 settings.panelTop = Math.round(rect.top);
                 saveSettings();
-                // Suppress click toggle immediately following a drag gesture
-                header._justDraggedAt = Date.now();
+                panel._justDraggedAt = Date.now();
             }
         }
 
-        header.addEventListener('pointerup', finishDrag);
-        header.addEventListener('pointercancel', finishDrag);
+        function startDrag(clientX, clientY, e) {
+            if (dragging) return;
+            if (isNonDragControl(e.target)) return;
 
-        win.addEventListener('resize', () => applySavedPanelPosition(panel));
+            if (e.cancelable) e.preventDefault();
+            e.stopPropagation();
+
+            const rect = panel.getBoundingClientRect();
+            dragging = true;
+            hasMoved = false;
+            startX = clientX;
+            startY = clientY;
+            origLeft = rect.left;
+            origTop = rect.top;
+
+            panel.style.setProperty('left', `${Math.round(origLeft)}px`, 'important');
+            panel.style.setProperty('top', `${Math.round(origTop)}px`, 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
+            header.style.setProperty('cursor', 'grabbing', 'important');
+
+            const targets = [ownerDoc, pageDoc, window].filter(Boolean);
+            for (const t of targets) {
+                try {
+                    t.addEventListener('mousemove', onMouseOrPointerMove, true);
+                    t.addEventListener('pointermove', onMouseOrPointerMove, true);
+                    t.addEventListener('mouseup', onEnd, true);
+                    t.addEventListener('pointerup', onEnd, true);
+                    t.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
+                    t.addEventListener('touchend', onEnd, true);
+                } catch (err) {}
+            }
+        }
+
+        // Bind on header AND compact body background in capture phase so WME never steals the drag
+        const dragZones = [header, panel.querySelector('#wme-need-a-road-compact')].filter(Boolean);
+        for (const zone of dragZones) {
+            zone.addEventListener('mousedown', (e) => {
+                if (e.button !== 0) return;
+                startDrag(e.clientX, e.clientY, e);
+            }, true);
+
+            zone.addEventListener('pointerdown', (e) => {
+                if (e.button !== undefined && e.button !== 0) return;
+                startDrag(e.clientX, e.clientY, e);
+            }, true);
+
+            zone.addEventListener('touchstart', (e) => {
+                if (e.touches && e.touches.length === 1) {
+                    startDrag(e.touches[0].clientX, e.touches[0].clientY, e);
+                }
+            }, { capture: true, passive: false });
+        }
+
+        ownerDoc.defaultView?.addEventListener('resize', () => applySavedPanelPosition(panel));
     }
 
     function setUiMode(mode) {
@@ -3183,100 +4119,119 @@
         const style = document.createElement('style');
         style.textContent = `
             #wme-need-a-road-panel {
-                position: fixed;
-                top: 85px;
-                right: 20px;
-                width: 356px;
-                background: #1e2430;
-                color: #f1f5f9;
-                border-radius: 12px;
-                box-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                z-index: 999999;
-                font-size: 13px;
+                position: fixed !important;
+                top: 80px;
+                right: 18px;
+                width: 392px;
+                margin: 0 !important;
+                transform: none !important;
+                pointer-events: auto !important;
+                background: #1b2230;
+                color: #f8fafc;
+                border-radius: 13px;
+                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.52);
+                font-family: "Rubik", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                z-index: 999999 !important;
+                font-size: 13.5px;
                 overflow: hidden;
-                border: 1px solid #334155;
-                transition: width 0.16s ease;
+                border: 2px solid #33ccff;
             }
             #wme-need-a-road-panel.nar-compact-mode {
-                width: 276px;
+                width: 320px;
             }
+            /* Iconic Waze Logo Cyan-Blue (#33CCFF) Header with Waze Charcoal Ink (#181d24) */
             #wme-need-a-road-header {
-                background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
-                padding: 8px 11px;
+                background: linear-gradient(135deg, #33ccff 0%, #15b2f7 100%) !important;
+                border-bottom: 2px solid #0b8fd8;
+                padding: 10px 12px;
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                cursor: grab;
-                user-select: none;
-                touch-action: none;
+                gap: 6px;
+                cursor: grab !important;
+                user-select: none !important;
+                -webkit-user-select: none !important;
+                touch-action: none !important;
             }
             #wme-need-a-road-header h4 {
                 margin: 0;
-                font-size: 13px;
-                font-weight: 700;
+                font-size: 15px;
+                font-weight: 800;
+                letter-spacing: -0.2px;
                 display: flex;
                 align-items: center;
-                gap: 5px;
-                color: #ffffff;
+                gap: 6px;
+                color: #141923;
                 white-space: nowrap;
+                pointer-events: none;
+            }
+            .nar-drag-grip {
+                font-size: 16px;
+                color: #141923;
+                opacity: 0.78;
+                margin-right: 1px;
             }
             .nar-hdr-btn {
-                background: rgba(15, 23, 42, 0.32);
-                color: #fff;
-                border: 1px solid rgba(255,255,255,0.28);
-                border-radius: 5px;
-                padding: 1px 6px;
-                font-size: 12px;
-                line-height: 16px;
+                background: #141923;
+                color: #ffffff;
+                border: 1px solid rgba(255,255,255,0.22);
+                border-radius: 7px;
+                padding: 3px 8px;
+                font-size: 13.5px;
+                line-height: 18px;
                 cursor: pointer;
-                font-weight: 700;
+                font-weight: 800;
             }
-            .nar-hdr-btn:hover { background: rgba(15, 23, 42, 0.55); }
+            .nar-hdr-btn:hover { background: #263042; }
             .nar-badge {
                 background: #ff2d55;
-                color: #fff;
-                border-radius: 10px;
-                padding: 1px 6px;
-                font-size: 11px;
-                font-weight: bold;
+                color: #ffffff;
+                border: 1.5px solid #141923;
+                border-radius: 12px;
+                padding: 2px 8px;
+                font-size: 12.5px;
+                font-weight: 800;
+                pointer-events: none;
             }
+            /* Larger, high-visibility Zoom Pill */
             .nar-zoom-pill {
-                background: rgba(0,0,0,0.3);
-                color: #e0f2fe;
-                border: 1px solid rgba(224,242,254,0.6);
-                border-radius: 10px;
-                padding: 1px 6px;
-                font-size: 10px;
-                font-weight: 600;
+                background: #141923;
+                color: #4ade80;
+                border: 1.5px solid #141923;
+                border-radius: 12px;
+                padding: 3px 9px;
+                font-size: 13px;
+                font-weight: 800;
                 cursor: pointer;
                 white-space: nowrap;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.25);
             }
             .nar-zoom-pill.nar-zoom-warning {
-                color: #fde68a;
-                border-color: #fbbf24;
-                background: rgba(245, 158, 11, 0.3);
+                background: #141923;
+                color: #fbbf24;
+                border-color: #f59e0b;
             }
             #wme-need-a-road-body {
-                padding: 11px;
-                max-height: 520px;
+                padding: 12px;
+                max-height: 560px;
                 overflow-y: auto;
             }
             #wme-need-a-road-compact {
-                padding: 9px 10px;
+                padding: 10px 11px;
                 background: #151c28;
+                cursor: grab;
             }
             .nar-compact-nav {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
                 gap: 6px;
-                margin-bottom: 7px;
+                margin-bottom: 8px;
             }
             .nar-compact-info {
                 flex: 1;
                 text-align: center;
-                font-size: 11.5px;
+                font-size: 13px;
                 font-weight: 700;
                 color: #f8fafc;
                 white-space: nowrap;
@@ -3284,24 +4239,73 @@
                 text-overflow: ellipsis;
             }
             .nar-compact-sub {
-                font-size: 10px;
-                color: #94a3b8;
+                font-size: 11.5px;
+                color: #cbd5e1;
                 font-weight: 500;
+                margin-top: 2px;
+                white-space: normal;
+                line-height: 1.3;
+            }
+            .nar-settings-top-bar {
+                background: #111827;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 7px 10px;
+                margin-bottom: 10px;
+            }
+            .nar-settings-toggle {
+                font-size: 12.5px;
+                font-weight: 700;
+                color: #33ccff;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                user-select: none;
+            }
+            .nar-settings-drawer {
+                display: none;
+                border-top: 1px solid #1e293b;
+                padding-top: 8px;
+                margin-top: 8px;
+                font-size: 12.5px;
+            }
+            .nar-setting-row {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 7px;
+                gap: 8px;
+            }
+            .nar-setting-row input[type="number"] {
+                width: 70px;
+                background: #1e293b;
+                border: 1px solid #475569;
+                color: #fff;
+                border-radius: 5px;
+                padding: 3px 6px;
+                font-size: 12.5px;
+                font-weight: 600;
+            }
+            .nar-setting-row input[type="checkbox"] {
+                width: 16px;
+                height: 16px;
+                cursor: pointer;
             }
             .nar-btn-row {
                 display: flex;
                 gap: 6px;
-                margin-bottom: 9px;
+                margin-bottom: 10px;
             }
             .nar-btn {
                 flex: 1;
                 background: #0284c7;
                 color: #fff;
                 border: none;
-                border-radius: 6px;
-                padding: 6px 7px;
-                font-size: 11px;
-                font-weight: 600;
+                border-radius: 7px;
+                padding: 8px 8px;
+                font-size: 12.5px;
+                font-weight: 700;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
@@ -3311,10 +4315,10 @@
             }
             .nar-btn:disabled { opacity: 0.55; cursor: not-allowed; }
             .nar-btn:hover:not(:disabled) { background: #0369a1; }
-            .nar-btn-secondary { background: #334155; color: #cbd5e1; }
+            .nar-btn-secondary { background: #334155; color: #e2e8f0; }
             .nar-btn-secondary:hover:not(:disabled) { background: #475569; }
-            .nar-btn-crawler { background: #8b5cf6; color: #fff; }
-            .nar-btn-crawler:hover:not(:disabled) { background: #7c3aed; }
+            .nar-btn-crawler { background: #7c3aed; color: #fff; }
+            .nar-btn-crawler:hover:not(:disabled) { background: #6d28d9; }
             .nar-btn-resume { background: #10b981; color: #fff; }
             .nar-btn-resume:hover:not(:disabled) { background: #059669; }
             .nar-btn-warning { background: #d97706; color: #fff; }
@@ -3327,11 +4331,12 @@
             .nar-btn-zoom18:hover:not(:disabled) { background: #c2410c; }
             .nar-icon-btn {
                 background: #334155;
-                color: #e2e8f0;
+                color: #f1f5f9;
                 border: 1px solid #475569;
-                border-radius: 4px;
-                padding: 3px 7px;
-                font-size: 11px;
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 12px;
+                font-weight: 600;
                 cursor: pointer;
                 flex-shrink: 0;
             }
@@ -3339,25 +4344,26 @@
             .nar-stats {
                 background: #0f172a;
                 border-radius: 8px;
-                padding: 7px 10px;
-                margin-bottom: 9px;
-                font-size: 11px;
+                padding: 8px 10px;
+                margin-bottom: 10px;
+                font-size: 12px;
                 display: flex;
                 justify-content: space-around;
                 border: 1px solid #1e293b;
             }
             .nar-stat-item { text-align: center; }
-            .nar-stat-num { font-size: 13.5px; font-weight: bold; color: #38bdf8; }
-            .nar-stat-label { color: #94a3b8; font-size: 10px; }
+            .nar-stat-num { font-size: 15px; font-weight: 800; color: #33ccff; }
+            .nar-stat-label { color: #cbd5e1; font-size: 11px; }
             .nar-status-box {
-                font-size: 11px;
-                color: #cbd5e1;
+                font-size: 12.5px;
+                line-height: 1.38;
+                color: #e2e8f0;
                 background: #0f172a;
-                border-left: 3px solid #0284c7;
-                padding: 6px 8px;
-                border-radius: 4px;
-                margin-bottom: 8px;
-                min-height: 24px;
+                border-left: 4px solid #33ccff;
+                padding: 7px 9px;
+                border-radius: 5px;
+                margin-bottom: 9px;
+                min-height: 28px;
                 display: flex;
                 align-items: center;
             }
@@ -3366,25 +4372,25 @@
                 justify-content: space-between;
                 align-items: center;
                 gap: 5px;
-                margin-bottom: 8px;
-                padding: 5px 7px;
+                margin-bottom: 9px;
+                padding: 6px 8px;
                 background: #0f172a;
                 border: 1px solid #1e293b;
                 border-radius: 6px;
-                font-size: 11px;
+                font-size: 12.5px;
             }
             .nar-crawler-box {
                 background: #131b2e;
-                border: 1px solid #3b82f6;
+                border: 1px solid #33ccff;
                 border-radius: 8px;
-                padding: 9px;
-                margin-bottom: 9px;
+                padding: 10px;
+                margin-bottom: 10px;
             }
             .nar-alert-list {
                 display: flex;
                 flex-direction: column;
-                gap: 7px;
-                max-height: 230px;
+                gap: 8px;
+                max-height: 240px;
                 overflow-y: auto;
                 padding-right: 2px;
             }
@@ -3392,12 +4398,12 @@
                 background: #182234;
                 border: 1px solid #334155;
                 border-left: 4px solid #ff2d55;
-                border-radius: 6px;
-                padding: 7px 8px;
+                border-radius: 7px;
+                padding: 8px 9px;
                 transition: transform 0.1s, border-color 0.1s;
             }
             .nar-alert-card.nar-card-active {
-                border-color: #38bdf8;
+                border-color: #33ccff;
                 background: #1d2a40;
             }
             .nar-alert-card:hover { border-color: #ff2d55; }
@@ -3405,71 +4411,43 @@
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-bottom: 3px;
+                margin-bottom: 4px;
             }
-            .nar-alert-title { font-weight: 700; color: #f8fafc; font-size: 12px; }
-            .nar-alert-meta { font-size: 10.5px; color: #94a3b8; margin-bottom: 6px; }
-            .nar-card-actions { display: flex; gap: 4px; }
+            .nar-alert-title { font-weight: 700; color: #f8fafc; font-size: 13px; }
+            .nar-alert-meta { font-size: 11.5px; color: #cbd5e1; margin-bottom: 7px; }
+            .nar-card-actions { display: flex; gap: 5px; }
             .nar-action-btn {
                 background: #334155;
-                color: #f1f5f9;
+                color: #f8fafc;
                 border: none;
-                border-radius: 4px;
-                padding: 4px 5px;
-                font-size: 10.5px;
+                border-radius: 5px;
+                padding: 5px 6px;
+                font-size: 11.5px;
                 cursor: pointer;
                 flex: 1;
-                font-weight: 600;
+                font-weight: 700;
                 text-align: center;
             }
             .nar-action-btn:hover { background: #475569; }
             .nar-action-btn-draw { background: #10b981; color: #fff; flex: 1.25; }
             .nar-action-btn-draw:hover { background: #059669; }
-            .nar-action-btn-done { background: #0284c7; color: #fff; flex: 0.9; }
+            .nar-action-btn-done { background: #0284c7; color: #fff; flex: 0.95; }
             .nar-action-btn-done:hover { background: #0369a1; }
-            .nar-action-btn-dismiss { background: #475569; color: #cbd5e1; flex: 0.45; }
+            .nar-action-btn-dismiss { background: #475569; color: #cbd5e1; flex: 0.5; }
             .nar-action-btn-dismiss:hover { background: #dc2626; color: #fff; }
-            .nar-settings-toggle {
-                font-size: 11px;
-                color: #38bdf8;
-                cursor: pointer;
-                text-align: right;
-                margin-top: 9px;
-                user-select: none;
-            }
-            .nar-settings-drawer {
-                display: none;
-                background: #0f172a;
-                border-radius: 6px;
-                padding: 8px;
-                margin-top: 8px;
-                font-size: 11px;
-            }
-            .nar-setting-row {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 6px;
-            }
-            .nar-setting-row input[type="number"] {
-                width: 66px;
-                background: #1e293b;
-                border: 1px solid #475569;
-                color: #fff;
-                border-radius: 4px;
-                padding: 2px 4px;
-            }
             .nar-toast {
                 position: fixed;
                 bottom: 24px;
                 right: 24px;
+                max-width: 420px;
                 background: #0f172a;
                 color: #fff;
-                padding: 10px 16px;
+                padding: 11px 16px;
                 border-radius: 8px;
-                border-left: 4px solid #0284c7;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.4);
-                font-size: 12px;
+                border-left: 4px solid #33ccff;
+                box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+                font-size: 13px;
+                line-height: 1.35;
                 z-index: 1000000;
                 transition: opacity 0.3s;
             }
@@ -3482,13 +4460,13 @@
         if (isCompactInit) panel.classList.add('nar-compact-mode');
 
         panel.innerHTML = `
-            <div id="wme-need-a-road-header" title="Drag to move anywhere on screen">
-                <h4>⠿ 🛣️ ${SCRIPT_NAME}</h4>
+            <div id="wme-need-a-road-header" title="Drag anywhere on this Waze-blue bar to move window">
+                <h4><span class="nar-drag-grip">⠿</span> 🛣️ ${SCRIPT_NAME}</h4>
                 <div style="display:flex; align-items:center; gap:5px;">
-                    <span id="nar-zoom-pill" class="nar-zoom-pill nar-hdr-ctrl" title="Click to zoom to level 18">Z18</span>
+                    <span id="nar-zoom-pill" class="nar-zoom-pill" title="Click to jump to Zoom 18 (or drag bar)">Zoom 18</span>
                     <span id="nar-stretch-count" class="nar-badge" style="display:none;">0</span>
-                    <button id="nar-mode-btn" class="nar-hdr-btn nar-hdr-ctrl" title="${isCompactInit ? 'Expand to Full Panel' : 'Shrink to Compact Fixer Bar'}">${isCompactInit ? '⤢' : '⤡'}</button>
-                    <button id="nar-toggle-btn" class="nar-hdr-btn nar-hdr-ctrl" title="Minimize / Restore">${settings.panelCollapsed ? '▲' : '▼'}</button>
+                    <button id="nar-mode-btn" class="nar-hdr-btn" title="${isCompactInit ? 'Expand to Full Panel' : 'Shrink to Compact Fixer Bar'}">${isCompactInit ? '⤢' : '⤡'}</button>
+                    <button id="nar-toggle-btn" class="nar-hdr-btn" title="Minimize / Restore">${settings.panelCollapsed ? '▲' : '▼'}</button>
                 </div>
             </div>
 
@@ -3504,7 +4482,7 @@
                 </div>
                 <div class="nar-card-actions">
                     <button id="nar-cmp-goto" class="nar-action-btn" title="Center map on this stretch at Zoom 18">🎯 Go</button>
-                    <button id="nar-cmp-draw" class="nar-action-btn nar-action-btn-draw" title="Draw straight minimal-node Street">🛣️ Draw</button>
+                    <button id="nar-cmp-draw" class="nar-action-btn nar-action-btn-draw" title="Draw & auto-snap road">🛣️ Draw</button>
                     <button id="nar-cmp-done" class="nar-action-btn nar-action-btn-done" title="Mark resolved & advance to next">✅ Done</button>
                     <button id="nar-cmp-copy" class="nar-action-btn" style="flex:0.55;" title="Copy Permalink">🔗</button>
                     <button id="nar-cmp-dismiss" class="nar-action-btn nar-action-btn-dismiss" title="Dismiss as false positive">✖️</button>
@@ -3513,6 +4491,60 @@
 
             <!-- FULL CONTROL & COMPILED QUEUE PANEL -->
             <div id="wme-need-a-road-body" style="display:${(!settings.panelCollapsed && !isCompactInit) ? 'block' : 'none'};">
+                <!-- SETTINGS & FILTER TUNING MOVED RIGHT TO THE TOP! -->
+                <div class="nar-settings-top-bar">
+                    <div id="nar-settings-link" class="nar-settings-toggle">
+                        <span>⚙️ Settings &amp; Filter Tuning</span>
+                        <span id="nar-settings-chevron">▼</span>
+                    </div>
+                    <div id="nar-settings-drawer" class="nar-settings-drawer">
+                        <div class="nar-setting-row">
+                            <span>Crawl Zoom Level (18–22):</span>
+                            <input type="number" id="nar-cfg-crawlzoom" value="${settings.crawlerZoomLevel}" min="18" max="22" step="1" />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Road Corridor (Meters):</span>
+                            <input type="number" id="nar-cfg-thresh" value="${settings.proximityThresholdMeters}" min="8" max="60" step="1" />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Draw Straightening (Meters):</span>
+                            <input type="number" id="nar-cfg-straighten" value="${settings.drawSimplifyToleranceMeters}" min="3" max="25" step="1" />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Min GPS Points/Stretch:</span>
+                            <input type="number" id="nar-cfg-minpts" value="${settings.minPointsPerStretch}" min="2" max="20" step="1" />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Cluster Radius (Meters):</span>
+                            <input type="number" id="nar-cfg-cluster" value="${settings.clusterDistanceMeters}" min="20" max="150" step="5" />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Crawler Tile Delay (ms):</span>
+                            <input type="number" id="nar-cfg-delay" value="${settings.crawlerStepDelayMs}" min="1000" max="5000" step="100" />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Only inside my Editable Area:</span>
+                            <input type="checkbox" id="nar-cfg-editableonly" ${settings.onlyInsideEditableArea ? 'checked' : ''} />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Shrink to Mini Window after scan:</span>
+                            <input type="checkbox" id="nar-cfg-autocompact" ${settings.autoCompactAfterScan ? 'checked' : ''} />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Auto-scan on map pan (Z18+):</span>
+                            <input type="checkbox" id="nar-cfg-autoscan" ${settings.autoScanOnMove ? 'checked' : ''} />
+                        </div>
+                        <div class="nar-setting-row">
+                            <span>Audio Chime on Alert:</span>
+                            <input type="checkbox" id="nar-cfg-sound" ${settings.soundAlerts ? 'checked' : ''} />
+                        </div>
+                        <div style="display:flex; justify-content:space-between; gap:6px; margin-top:8px;">
+                            <button id="nar-btn-reset-dismissed" class="nar-action-btn" style="padding:5px 7px;">🔄 Reset Dismissed (${dismissedStretches.size})</button>
+                            <button id="nar-btn-clear" class="nar-action-btn" style="padding:5px 7px;">🧹 Hide Overlays</button>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="nar-btn-row">
                     <button id="nar-btn-scan" class="nar-btn">
                         <span>🔍</span> Scan View
@@ -3527,12 +4559,12 @@
 
                 <!-- Area Crawler Section (4 km², 20 km², Editable Areas, Viewport) -->
                 <div class="nar-crawler-box">
-                    <div style="font-weight:bold; font-size:11px; margin-bottom:5px; color:#38bdf8; display:flex; justify-content:space-between; align-items:center;">
+                    <div style="font-weight:700; font-size:12.5px; margin-bottom:6px; color:#33ccff; display:flex; justify-content:space-between; align-items:center;">
                         <span id="nar-crawler-title">🌐 Area Scanner (Zoom ${settings.crawlerZoomLevel}+)</span>
-                        <span id="nar-crawler-progress-label" style="color:#94a3b8; font-weight:normal;"></span>
+                        <span id="nar-crawler-progress-label" style="color:#cbd5e1; font-weight:600;"></span>
                     </div>
-                    <div style="display:flex; gap:5px; margin-bottom:7px;">
-                        <select id="nar-crawler-area-select" style="flex:1; min-width:0; background:#1e293b; color:#fff; border:1px solid #475569; border-radius:4px; padding:4px; font-size:11px;">
+                    <div style="display:flex; gap:5px; margin-bottom:8px;">
+                        <select id="nar-crawler-area-select" style="flex:1; min-width:0; background:#1e293b; color:#fff; border:1px solid #475569; border-radius:5px; padding:5px 6px; font-size:12.5px;">
                             <option value="0" data-area-id="scan_area_4km2">🗺️ Surrounding Window (4 km²)</option>
                         </select>
                         <button id="nar-btn-refresh-areas" class="nar-icon-btn" title="Reload Editable & Window Scan Areas">🔄</button>
@@ -3562,7 +4594,7 @@
                         <div class="nar-stat-label">View GPS</div>
                     </div>
                     <div class="nar-stat-item">
-                        <div id="nar-stat-covered" class="nar-stat-num" style="color:#10b981;">0</div>
+                        <div id="nar-stat-covered" class="nar-stat-num" style="color:#4ade80;">0</div>
                         <div class="nar-stat-label">On Road</div>
                     </div>
                     <div class="nar-stat-item">
@@ -3577,59 +4609,15 @@
 
                 <!-- Persistent Compiled Queue Toolbar -->
                 <div id="nar-queue-toolbar" class="nar-queue-bar" style="display:none;">
-                    <span id="nar-queue-summary" style="color:#e2e8f0; font-weight:600;">📋 0 Queued</span>
-                    <div style="display:flex; gap:4px;">
+                    <span id="nar-queue-summary" style="color:#f8fafc; font-weight:700;">📋 0 Queued</span>
+                    <div style="display:flex; gap:5px;">
                         <button id="nar-btn-export-csv" class="nar-icon-btn" title="Download compiled queue as CSV spreadsheet">💾 CSV</button>
-                        <button id="nar-btn-mini-work" class="nar-icon-btn" style="background:#0284c7; border-color:#38bdf8;" title="Switch to small draggable Fixer Bar">⤡ Work Mode</button>
+                        <button id="nar-btn-mini-work" class="nar-icon-btn" style="background:#0284c7; border-color:#33ccff;" title="Switch to small draggable Fixer Bar">⤡ Work Mode</button>
                         <button id="nar-btn-clear-queue" class="nar-icon-btn" title="Clear all stretches from saved queue">🗑️ Clear</button>
                     </div>
                 </div>
 
                 <div id="nar-alerts-container" class="nar-alert-list"></div>
-
-                <div id="nar-settings-link" class="nar-settings-toggle">⚙️ Settings & Filter Tuning ▼</div>
-                <div id="nar-settings-drawer" class="nar-settings-drawer">
-                    <div class="nar-setting-row">
-                        <span>Crawl Zoom Level (18–22):</span>
-                        <input type="number" id="nar-cfg-crawlzoom" value="${settings.crawlerZoomLevel}" min="18" max="22" step="1" />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Road Tolerance (Meters):</span>
-                        <input type="number" id="nar-cfg-thresh" value="${settings.proximityThresholdMeters}" min="2" max="60" step="1" />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Draw Straightening (Meters):</span>
-                        <input type="number" id="nar-cfg-straighten" value="${settings.drawSimplifyToleranceMeters}" min="3" max="25" step="1" title="Higher = straighter roads with fewer geometry nodes" />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Min GPS Points/Stretch:</span>
-                        <input type="number" id="nar-cfg-minpts" value="${settings.minPointsPerStretch}" min="1" max="20" step="1" />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Cluster Radius (Meters):</span>
-                        <input type="number" id="nar-cfg-cluster" value="${settings.clusterDistanceMeters}" min="20" max="150" step="5" />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Crawler Tile Delay (ms):</span>
-                        <input type="number" id="nar-cfg-delay" value="${settings.crawlerStepDelayMs}" min="1000" max="5000" step="100" />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Shrink to Mini Window after scan:</span>
-                        <input type="checkbox" id="nar-cfg-autocompact" ${settings.autoCompactAfterScan ? 'checked' : ''} />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Auto-scan on map pan (Z18+):</span>
-                        <input type="checkbox" id="nar-cfg-autoscan" ${settings.autoScanOnMove ? 'checked' : ''} />
-                    </div>
-                    <div class="nar-setting-row">
-                        <span>Audio Chime on Alert:</span>
-                        <input type="checkbox" id="nar-cfg-sound" ${settings.soundAlerts ? 'checked' : ''} />
-                    </div>
-                    <div style="display:flex; justify-content:space-between; gap:6px; margin-top:8px;">
-                        <button id="nar-btn-reset-dismissed" class="nar-action-btn" style="padding:4px 6px;">🔄 Reset Dismissed (${dismissedStretches.size})</button>
-                        <button id="nar-btn-clear" class="nar-action-btn" style="padding:4px 6px;">🧹 Hide Overlays</button>
-                    </div>
-                </div>
             </div>
         `;
 
@@ -3638,28 +4626,39 @@
         makePanelDraggable(panel, headerEl);
         applySavedPanelPosition(panel);
 
-        // Header Controls
+        // Header Controls (respects _justDraggedAt so dragging never misfires click actions!)
         headerEl.onclick = (e) => {
-            if (headerEl._justDraggedAt && Date.now() - headerEl._justDraggedAt < 250) return;
-            if (e.target.closest('.nar-hdr-ctrl')) return;
+            if (panel._justDraggedAt && Date.now() - panel._justDraggedAt < 280) return;
+            if (e.target.closest('button, #nar-zoom-pill')) return;
             togglePanel();
         };
         document.getElementById('nar-toggle-btn').onclick = (e) => {
             e.stopPropagation();
+            if (panel._justDraggedAt && Date.now() - panel._justDraggedAt < 280) return;
             togglePanel();
         };
         document.getElementById('nar-mode-btn').onclick = (e) => {
             e.stopPropagation();
+            if (panel._justDraggedAt && Date.now() - panel._justDraggedAt < 280) return;
             setUiMode(settings.uiMode === 'compact' ? 'full' : 'compact');
         };
         document.getElementById('nar-zoom-pill').onclick = (e) => {
             e.stopPropagation();
+            if (panel._justDraggedAt && Date.now() - panel._justDraggedAt < 280) return;
             zoomTo18AndScan();
         };
 
         // Compact Fixer Window Bindings
-        document.getElementById('nar-cmp-prev').onclick = () => jumpToStretchByIndex(activeStretchIndex - 1);
-        document.getElementById('nar-cmp-next').onclick = () => jumpToStretchByIndex(activeStretchIndex + 1);
+        document.getElementById('nar-cmp-prev').onclick = () => {
+            lastDrawnStretchId = null;
+            lastDrawReminderMsg = '';
+            jumpToStretchByIndex(activeStretchIndex - 1);
+        };
+        document.getElementById('nar-cmp-next').onclick = () => {
+            lastDrawnStretchId = null;
+            lastDrawReminderMsg = '';
+            jumpToStretchByIndex(activeStretchIndex + 1);
+        };
         document.getElementById('nar-cmp-goto').onclick = () => jumpToStretchByIndex(activeStretchIndex);
         document.getElementById('nar-cmp-draw').onclick = () => {
             const s = currentResults.stretches[activeStretchIndex];
@@ -3667,7 +4666,10 @@
         };
         document.getElementById('nar-cmp-done').onclick = () => {
             const s = currentResults.stretches[activeStretchIndex];
-            if (s) resolveStretchById(s.id, false);
+            if (s) {
+                if (lastDrawnStretchId === s.id) { lastDrawnStretchId = null; lastDrawReminderMsg = ''; }
+                resolveStretchById(s.id, false);
+            }
         };
         document.getElementById('nar-cmp-copy').onclick = () => {
             const s = currentResults.stretches[activeStretchIndex];
@@ -3678,7 +4680,10 @@
         };
         document.getElementById('nar-cmp-dismiss').onclick = () => {
             const s = currentResults.stretches[activeStretchIndex];
-            if (s) resolveStretchById(s.id, true);
+            if (s) {
+                if (lastDrawnStretchId === s.id) { lastDrawnStretchId = null; lastDrawReminderMsg = ''; }
+                resolveStretchById(s.id, true);
+            }
         };
 
         // Main Panel Bindings
@@ -3731,10 +4736,11 @@
 
         const settingsLink = document.getElementById('nar-settings-link');
         const settingsDrawer = document.getElementById('nar-settings-drawer');
+        const settingsChevron = document.getElementById('nar-settings-chevron');
         settingsLink.onclick = () => {
             const isVisible = settingsDrawer.style.display === 'block';
             settingsDrawer.style.display = isVisible ? 'none' : 'block';
-            settingsLink.textContent = isVisible ? '⚙️ Settings & Filter Tuning ▼' : '⚙️ Settings & Filter Tuning ▲';
+            if (settingsChevron) settingsChevron.textContent = isVisible ? '▼' : '▲';
         };
 
         document.getElementById('nar-cfg-crawlzoom').onchange = (e) => {
@@ -3746,28 +4752,33 @@
             if (titleEl) titleEl.textContent = `🌐 Area Scanner (Zoom ${val}+)`;
         };
         document.getElementById('nar-cfg-thresh').onchange = (e) => {
-            settings.proximityThresholdMeters = Math.max(2, parseFloat(e.target.value) || 6);
+            settings.proximityThresholdMeters = Math.max(8, parseFloat(e.target.value) || 18);
             saveSettings();
             if (getCurrentZoom() >= 18) debounceScan(250);
         };
         document.getElementById('nar-cfg-straighten').onchange = (e) => {
             settings.drawSimplifyToleranceMeters = Math.max(3, Math.min(25, parseFloat(e.target.value) || 8));
             saveSettings();
-            renderHighlights(currentResults.stretches, currentResults.stretches.flatMap(s => s.points));
+            renderHighlights(currentResults.stretches);
         };
         document.getElementById('nar-cfg-minpts').onchange = (e) => {
-            settings.minPointsPerStretch = Math.max(1, parseInt(e.target.value, 10) || 3);
+            settings.minPointsPerStretch = Math.max(2, parseInt(e.target.value, 10) || 4);
             saveSettings();
             if (getCurrentZoom() >= 18) debounceScan(250);
         };
         document.getElementById('nar-cfg-cluster').onchange = (e) => {
-            settings.clusterDistanceMeters = Math.max(15, parseFloat(e.target.value) || 60);
+            settings.clusterDistanceMeters = Math.max(15, parseFloat(e.target.value) || 55);
             saveSettings();
             if (getCurrentZoom() >= 18) debounceScan(250);
         };
         document.getElementById('nar-cfg-delay').onchange = (e) => {
             settings.crawlerStepDelayMs = Math.max(800, parseInt(e.target.value, 10) || 1800);
             saveSettings();
+        };
+        document.getElementById('nar-cfg-editableonly').onchange = (e) => {
+            settings.onlyInsideEditableArea = e.target.checked;
+            saveSettings();
+            if (getCurrentZoom() >= 18) debounceScan(250);
         };
         document.getElementById('nar-cfg-autocompact').onchange = (e) => {
             settings.autoCompactAfterScan = e.target.checked;
@@ -3795,16 +4806,16 @@
 
         const z = getCurrentZoom();
         if (z < 18) {
-            pill.className = 'nar-zoom-pill nar-zoom-warning nar-hdr-ctrl';
-            pill.textContent = `Z${z} ⚠️`;
+            pill.className = 'nar-zoom-pill nar-zoom-warning';
+            pill.textContent = `Zoom ${z} ⚠️`;
             pill.title = `Current zoom is ${z}. GPS traces require Zoom 18+. Click to zoom to 18!`;
             if (btn && !isScanning) {
                 btn.className = 'nar-btn nar-btn-zoom18';
                 btn.innerHTML = '<span>🔍</span> Zoom 18 &amp; Scan';
             }
         } else {
-            pill.className = 'nar-zoom-pill nar-hdr-ctrl';
-            pill.textContent = `Z${z} ✅`;
+            pill.className = 'nar-zoom-pill';
+            pill.textContent = `Zoom ${z} ✅`;
             pill.title = `Zoom ${z} active — GPS traces load at Zoom 18+.`;
             if (btn && !isScanning) {
                 btn.className = 'nar-btn';
@@ -3901,7 +4912,7 @@
         const card = document.getElementById(`nar-card-${stretchId}`);
         if (card) {
             card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-            card.style.borderColor = '#38bdf8';
+            card.style.borderColor = '#33ccff';
             setTimeout(() => { card.style.borderColor = ''; }, 1500);
         }
     }
@@ -3928,6 +4939,7 @@
         if (!hasItems) {
             titleEl.textContent = '🎉 Queue All Clear!';
             subEl.textContent = 'Click ⤢ to expand & scan an area';
+            subEl.style.color = '#cbd5e1';
             return;
         }
 
@@ -3937,7 +4949,13 @@
         const internalNodes = Math.max(0, cleanNodes.length - 2);
 
         titleEl.textContent = `🚨 Stretch ${activeStretchIndex + 1} of ${total} (~${cur.approxLengthMeters}m)`;
-        subEl.textContent = `${cur.pointCount} GPS pts • ${internalNodes === 0 ? 'Straight line' : `${internalNodes} bend node(s)`}`;
+        if (lastDrawnStretchId === cur.id && lastDrawReminderMsg) {
+            subEl.textContent = '⚠️ Check Road Type & Turns • Save in WME to auto-advance!';
+            subEl.style.color = '#fbbf24';
+        } else {
+            subEl.textContent = `${cur.pointCount} GPS pts • ${internalNodes === 0 ? 'Straight line' : `${internalNodes} bend node(s)`}`;
+            subEl.style.color = '#cbd5e1';
+        }
     }
 
     function renderAlertList() {
@@ -4097,6 +5115,23 @@
         }
     }
 
+    function onWmeSaveFinished() {
+        if (!lastDrawnStretchId) return;
+        const drawnId = lastDrawnStretchId;
+        lastDrawnStretchId = null;
+        lastDrawReminderMsg = '';
+
+        const exists = currentResults.stretches.some(s => s.id === drawnId);
+        if (exists) {
+            resolveStretchById(drawnId, false);
+            updateStatusText(`✅ Saved! Auto-completed Stretch & queued next (${currentResults.stretches.length} remaining).`);
+            if (currentResults.stretches.length > 0 && settings.uiMode === 'compact') {
+                // Smoothly center on the new active stretch in Compact Mode!
+                setTimeout(() => jumpToStretchByIndex(activeStretchIndex), 350);
+            }
+        }
+    }
+
     function setupMapListeners() {
         let sdkBound = false;
         if (wmeSDK && wmeSDK.Events && typeof wmeSDK.Events.on === 'function') {
@@ -4105,6 +5140,7 @@
                 wmeSDK.Events.on({ eventName: 'wme-map-zoom-changed', eventHandler: onViewportChanged });
                 wmeSDK.Events.on({ eventName: 'wme-user-areas-loaded', eventHandler: () => populateAreaPicker() });
                 wmeSDK.Events.on({ eventName: 'wme-logged-in', eventHandler: () => populateAreaPicker() });
+                wmeSDK.Events.on({ eventName: 'wme-save-finished', eventHandler: onWmeSaveFinished });
                 sdkBound = true;
             } catch (e) {}
         }
@@ -4112,6 +5148,16 @@
         if (!sdkBound && win.W && win.W.map && win.W.map.events && typeof win.W.map.events.register === 'function') {
             win.W.map.events.register('moveend', null, onViewportChanged);
             win.W.map.events.register('zoomend', null, onViewportChanged);
+        }
+
+        if (win.W && win.W.model && win.W.model.actionManager && win.W.model.actionManager.events &&
+            typeof win.W.model.actionManager.events.register === 'function') {
+            try {
+                // Fires right after WME commits a Save and clears pending edit actions
+                win.W.model.actionManager.events.register('afterclearactions', null, () => {
+                    if (lastDrawnStretchId) setTimeout(onWmeSaveFinished, 150);
+                });
+            } catch (e) {}
         }
 
         if (win.W && win.W.loginManager && win.W.loginManager.events && typeof win.W.loginManager.events.register === 'function') {
